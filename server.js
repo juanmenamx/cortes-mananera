@@ -1,5 +1,6 @@
 const http = require('node:http');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { randomUUID } = require('node:crypto');
@@ -8,6 +9,7 @@ const {
   addSeconds,
   buildClipUrl,
   clock,
+  clockAt,
   parseClipUrl,
   rangeLabel,
   segmentPlan,
@@ -22,12 +24,14 @@ const { assertTranscriptionReady, formatBlock, looksLikeHallucination, transcrib
 
 const PORT = Number(process.env.PORT || 4311);
 const PUBLIC_DIR = path.join(__dirname, 'public');
-const TEMP_DIR = path.join(__dirname, 'temp');
+const OUTPUT_DIR = process.env.CORTES_DIR || path.join(process.env.USERPROFILE || os.homedir(), 'Videos', 'Cortes de la conferencia');
+const TEMP_DIR = process.env.TEMP_DIR || path.join(process.env.LOCALAPPDATA || os.tmpdir(), 'cortes-mananera', 'temp');
 const FFMPEG = process.env.FFMPEG_PATH || path.join(__dirname, '..', 'youtube-portable', 'bin', 'ffmpeg.exe');
 const GRACE_MS = Number(process.env.CLIP_GRACE_MS || 60000);
 const POLL_MS = 2000;
 
 fs.mkdirSync(TEMP_DIR, { recursive: true });
+fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
 let active = null;
 const clients = new Set();
@@ -115,6 +119,12 @@ function run(command, args) {
   });
 }
 
+function publishCut(output, filename) {
+  const saved = path.join(OUTPUT_DIR, filename);
+  fs.copyFileSync(output, saved);
+  return saved;
+}
+
 function mediaUrl(sessionId, kind, filename) {
   return `/media/${sessionId}/${kind}/${encodeURIComponent(filename)}`;
 }
@@ -126,7 +136,10 @@ function publicClip(session, clip) {
     from: clip.from,
     to: clip.to,
     text: clip.text,
-    mediaUrl: mediaUrl(session.id, 'clips', clip.filename)
+    words: clip.words || [],
+    offset: clip.offset || 0,
+    mediaUrl: mediaUrl(session.id, 'clips', clip.filename),
+    sourceMediaUrl: clip.sourceMediaUrl || ''
   };
 }
 
@@ -137,6 +150,7 @@ function snapshot(session) {
     clock: session.clock || '—',
     count: session.clips.length,
     previewUrl: session.previewUrl || '',
+    sources: session.sources || [],
     openClips: session.clips.filter(clip => clip.ready && clip.blockNumber == null).map(clip => publicClip(session, clip)),
     blocks: session.blocks
   };
@@ -216,10 +230,15 @@ async function cutVideos(clips, output) {
   }
 }
 
+function timedText(clip) {
+  if (clip.words?.length) return clip.words.map(word => `[${word.clock}] ${word.word}`).join(' ');
+  return clip.text;
+}
+
 function serverTranscript(clips) {
   return clips
     .filter(clip => clip.text)
-    .map(clip => `[${clip.label}] ${clip.text}`)
+    .map(clip => `[${clip.label}] ${timedText(clip)}`)
     .join('\n\n');
 }
 
@@ -240,12 +259,14 @@ async function buildBlock(session, clips, blockNumber, editedText) {
     formatted: '',
     formatError: '',
     videoUrl: '',
+    savedPath: '',
     cutError: ''
   };
 
   const tasks = [
     cutVideos(clips, output).then(() => {
       block.videoUrl = mediaUrl(session.id, 'cortes', filename);
+      block.savedPath = publishCut(output, filename);
     }).catch(error => {
       block.cutError = error.message;
       log('No se pudo cortar el bloque', { blockNumber, message: error.message });
@@ -294,7 +315,7 @@ function segmentFilename(source, stamp, offset) {
   return `${parsed.name}-${String(offset).padStart(2, '0')}${parsed.ext}`;
 }
 
-async function publishSegment(session, source, fileStamp, url, sourceFile, part) {
+async function publishSegment(session, source, fileStamp, url, sourceFile, sourceMediaUrl, part) {
   const stamp = addSeconds(fileStamp, part.offset);
   const toStamp = addSeconds(stamp, part.duration);
   const filename = segmentFilename(source, fileStamp, part.offset);
@@ -311,6 +332,9 @@ async function publishSegment(session, source, fileStamp, url, sourceFile, part)
     filename,
     file,
     text: '',
+    words: [],
+    offset: part.offset,
+    sourceMediaUrl,
     ready: false,
     blockNumber: null
   };
@@ -320,9 +344,15 @@ async function publishSegment(session, source, fileStamp, url, sourceFile, part)
   await cutSegment(sourceFile, file, part.offset, part.duration);
   try {
     await extractAudio(file, wav);
-    const text = await transcribe(wav);
+    const result = await transcribe(wav);
+    const text = String(result?.text || '').trim();
     if (!looksLikeHallucination(text, session.lastText)) {
       clip.text = text;
+      clip.words = (result.words || []).map(word => ({
+        word: word.word,
+        at: Math.round((part.offset + word.start) * 100) / 100,
+        clock: clockAt(fileStamp, part.offset + word.start)
+      }));
       session.lastText = text;
     }
   } catch (error) {
@@ -339,7 +369,7 @@ async function publishSegment(session, source, fileStamp, url, sourceFile, part)
   session.previewUrl = mediaUrl(session.id, 'clips', filename);
   session.message = clip.text ? 'Transcribiendo' : 'Segmento recibido; esperando voz clara…';
   sendEvent('clip', publicClip(session, clip));
-  if (clip.text) sendEvent('transcript', { index: clip.index, text: clip.text, label: clip.label });
+  if (clip.text) sendEvent('transcript', publicClip(session, clip));
   else sendEvent('silence', { index: clip.index, label: clip.label });
   sendEvent('status', { state: 'running', message: session.message, clock: clip.label, count: session.clips.length });
   if (clip.authError) throw clip.authError;
@@ -353,6 +383,10 @@ async function ingestClip(session, source, stamp) {
   session.message = `Descargando ${label}`;
   sendEvent('status', { state: 'running', message: session.message, clock: label, count: session.clips.length });
   await downloadClip(url, sourceFile);
+  const sourceMediaUrl = mediaUrl(session.id, 'clips', sourceName);
+  session.sources.push({ mediaUrl: sourceMediaUrl, label });
+  session.previewUrl = sourceMediaUrl;
+  sendEvent('source', { mediaUrl: sourceMediaUrl, label, playableSeconds: CLIP_STEP_SECONDS });
 
   for (const part of segmentPlan()) {
     while (session.pause && !session.stopping) await sleep(40);
@@ -364,7 +398,7 @@ async function ingestClip(session, source, stamp) {
       continue;
     }
     try {
-      await publishSegment(session, source, stamp, url, sourceFile, part);
+      await publishSegment(session, source, stamp, url, sourceFile, sourceMediaUrl, part);
     } catch (error) {
       if (isAuthError(error)) throw error;
       log('No se pudo transcribir un segmento', { stamp, offset: part.offset, message: publicError(error) });
@@ -434,6 +468,7 @@ async function startSession(clipUrl) {
     message: 'Buscando el primer clip…',
     clock: rangeLabel(source.stamp),
     previewUrl: '',
+    sources: [],
     finalBlock: null,
     exclusive: createLock()
   };

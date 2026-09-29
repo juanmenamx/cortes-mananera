@@ -72,6 +72,8 @@ h2 { font-family: Georgia, serif; font-size: 1.5rem; font-weight: 500; margin: 0
 .transcript p { margin: 0 0 1em; }
 .transcript .placeholder { color: #9aa29e; font-style: italic; }
 .transcript time { color: var(--green); display: block; font-family: Inter, sans-serif; font-size: .75rem; font-style: normal; font-weight: 750; letter-spacing: .04em; margin-bottom: 2px; }
+.transcript .word time { display: inline; font-size: .68rem; font-weight: 700; letter-spacing: 0; margin: 0 4px 0 0; }
+.transcript p.pending, .transcript .word.pending { display: none; }
 
 .blocks-section { margin-top: 28px; }
 .blocks-heading { margin-bottom: 14px; }
@@ -83,6 +85,7 @@ h2 { font-family: Georgia, serif; font-size: 1.5rem; font-weight: 500; margin: 0
 .block-state.ready { color: var(--green); font-weight: 750; }
 .block-state.error { color: var(--red); }
 .block-video { background: #101311; display: block; max-height: 320px; width: 100%; }
+.saved-path { color: var(--muted); font-size: .78rem; margin: 0; padding: 10px 16px 0; word-break: break-all; }
 .formatted { margin: 0; min-height: 90px; outline: none; padding: 18px; white-space: pre-wrap; font: 1rem/1.65 Georgia, serif; }
 .block-card-actions { border-top: 1px solid var(--line); justify-content: flex-end; padding: 10px 14px; }
 .raw-details { border-top: 1px solid var(--line); color: var(--muted); font-size: .78rem; padding: 10px 16px 14px; }

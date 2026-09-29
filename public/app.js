@@ -20,6 +20,111 @@ let running = false;
 let sawSnapshot = false;
 const archive = [];
 const seenBlocks = new Set();
+const files = [];
+const cues = [];
+let playIndex = -1;
+let advancing = false;
+const PLAYABLE_SECONDS = 30;
+
+function resetPlayback() {
+  files.length = 0;
+  cues.length = 0;
+  playIndex = -1;
+  advancing = false;
+  delete preview.dataset.stalled;
+  preview.pause();
+  preview.removeAttribute('src');
+  preview.load();
+  videoFrame.classList.remove('has-video');
+  previewLabel.textContent = 'Sin video';
+}
+
+function enqueueSource(mediaUrl, label) {
+  if (!mediaUrl || files.some(file => file.mediaUrl === mediaUrl)) return;
+  const stalled = preview.dataset.stalled === '1';
+  files.push({ mediaUrl, label });
+  if (playIndex < 0) playFile(0);
+  else if (stalled) playFile(playIndex + 1);
+}
+
+function playFile(index) {
+  const file = files[index];
+  if (!file) return;
+  playIndex = index;
+  advancing = false;
+  delete preview.dataset.stalled;
+  previewLabel.textContent = file.label || 'Clip';
+  videoFrame.classList.add('has-video');
+  preview.src = file.mediaUrl;
+  revealCues(file.mediaUrl, 0);
+  for (const earlier of files.slice(0, index)) revealCues(earlier.mediaUrl, PLAYABLE_SECONDS);
+  const started = preview.play();
+  if (started) started.catch(() => {});
+}
+
+function advancePlayback() {
+  if (advancing) return;
+  advancing = true;
+  const file = files[playIndex];
+  if (file) revealCues(file.mediaUrl, PLAYABLE_SECONDS);
+  if (files[playIndex + 1]) playFile(playIndex + 1);
+  else {
+    advancing = false;
+    preview.dataset.stalled = '1';
+  }
+}
+
+function revealCues(mediaUrl, time) {
+  for (const cue of cues) {
+    if (cue.sourceMediaUrl !== mediaUrl) continue;
+    mountCue(cue);
+    const paragraph = transcript.querySelector(`p[data-index="${cue.index}"]`);
+    if (!paragraph || !cue.words) continue;
+    const spans = [...paragraph.querySelectorAll('.word')];
+    let revealed = false;
+    cue.words.forEach((word, index) => {
+      if (word.shown || time + 0.05 < word.at) return;
+      word.shown = true;
+      revealed = true;
+      spans[index]?.classList.remove('pending');
+    });
+    if (revealed) {
+      paragraph.classList.remove('pending');
+      transcript.scrollTop = transcript.scrollHeight;
+    }
+  }
+}
+
+function rememberCue(data) {
+  let cue = cues.find(item => item.index === data.index);
+  if (!cue) {
+    cue = { index: data.index, text: '', offset: 0, sourceMediaUrl: '', label: '', words: null, mounted: false };
+    cues.push(cue);
+  }
+  if (data.label) cue.label = data.label;
+  if (Number.isFinite(data.offset)) cue.offset = data.offset;
+  if (data.sourceMediaUrl) cue.sourceMediaUrl = data.sourceMediaUrl;
+  if (data.text) cue.text = data.text;
+  if (Array.isArray(data.words) && data.words.length && !cue.words?.length) {
+    cue.words = data.words.map(word => ({ ...word, shown: false }));
+  }
+  if (!cue.text && !cue.words?.length) return;
+  const fileIndex = files.findIndex(file => file.mediaUrl === cue.sourceMediaUrl);
+  const passed = fileIndex >= 0 && (fileIndex < playIndex || (fileIndex === playIndex && preview.dataset.stalled === '1'));
+  if (passed) revealCues(cue.sourceMediaUrl, PLAYABLE_SECONDS);
+  else if (files[playIndex]?.mediaUrl === cue.sourceMediaUrl) revealCues(cue.sourceMediaUrl, preview.currentTime || 0);
+}
+
+preview.addEventListener('timeupdate', () => {
+  const file = files[playIndex];
+  if (!file || advancing) return;
+  if (preview.currentTime >= PLAYABLE_SECONDS) {
+    advancePlayback();
+    return;
+  }
+  revealCues(file.mediaUrl, preview.currentTime);
+});
+preview.addEventListener('ended', () => advancePlayback());
 
 function setStatus(state, message, meta = {}) {
   running = state === 'running' || state === 'connecting';
@@ -42,7 +147,17 @@ function segmentCount(value) {
 }
 
 function currentTranscript() {
-  return transcript.querySelector('.placeholder') ? '' : transcript.innerText.trim();
+  const paragraphs = [...transcript.querySelectorAll('p[data-index]')];
+  if (!paragraphs.length) return '';
+  return paragraphs.map(paragraph => {
+    const heading = paragraph.querySelector(':scope > time')?.textContent || '';
+    const words = [...paragraph.querySelectorAll('.word')].map(span => {
+      const stamp = span.querySelector('time')?.textContent || '';
+      const word = [...span.childNodes].filter(node => node.nodeType === Node.TEXT_NODE).map(node => node.textContent).join(' ').trim();
+      return `[${stamp}] ${word}`;
+    });
+    return `[${heading}] ${words.join(' ')}`.trim();
+  }).join('\n\n');
 }
 
 function ensureTranscript() {
@@ -50,26 +165,33 @@ function ensureTranscript() {
   if (placeholder) placeholder.remove();
 }
 
-function appendTranscript(index, label, text) {
-  archive.push({ index, label, text });
+function mountCue(cue) {
+  if (cue.mounted || (!cue.text && !cue.words?.length)) return;
+  if (!cue.words?.length && cue.text) {
+    cue.words = [{ word: cue.text, at: cue.offset, clock: cue.label, shown: false }];
+  }
+  cue.mounted = true;
   ensureTranscript();
   const paragraph = document.createElement('p');
-  paragraph.dataset.index = String(index);
-  const time = document.createElement('time');
-  time.textContent = label;
-  paragraph.append(time, document.createTextNode(text));
-  transcript.appendChild(paragraph);
-  transcript.scrollTop = transcript.scrollHeight;
-}
-
-function showPreview(mediaUrl, label) {
-  if (!mediaUrl) return;
-  previewLabel.textContent = label || 'Clip';
-  videoFrame.classList.add('has-video');
-  if (preview.getAttribute('src') !== mediaUrl) {
-    preview.src = mediaUrl;
-    preview.play().catch(() => {});
+  paragraph.dataset.index = String(cue.index);
+  paragraph.classList.add('pending');
+  const heading = document.createElement('time');
+  heading.textContent = cue.label;
+  paragraph.append(heading);
+  for (const word of cue.words) {
+    const span = document.createElement('span');
+    span.className = 'word pending';
+    const stamp = document.createElement('time');
+    stamp.textContent = word.clock;
+    span.append(stamp, document.createTextNode(` ${word.word}`));
+    paragraph.append(document.createTextNode(' '), span);
   }
+  transcript.appendChild(paragraph);
+  archive.push({
+    index: cue.index,
+    label: cue.label,
+    text: cue.words.map(word => `[${word.clock}] ${word.word}`).join(' ')
+  });
 }
 
 function takeClosedParagraphs(lastIndex) {
@@ -97,6 +219,7 @@ function addBlockCard(block) {
     </div>
     <p class="block-meta"></p>
     <video class="block-video" controls playsinline></video>
+    <p class="saved-path"></p>
     <pre class="formatted" contenteditable="true"></pre>
     <div class="block-card-actions">
       <a class="secondary download-block" download>Descargar video</a>
@@ -115,13 +238,16 @@ function addBlockCard(block) {
   card.querySelector('.block-meta').textContent = `${block.label} · ${segmentCount(block.clipCount)}`;
   const video = card.querySelector('.block-video');
   const download = card.querySelector('.download-block');
+  const saved = card.querySelector('.saved-path');
   if (block.videoUrl) {
     video.src = block.videoUrl;
     download.href = block.videoUrl;
     download.download = `bloque-${block.blockNumber}.mp4`;
+    saved.textContent = block.savedPath ? `Guardado en ${block.savedPath}` : '';
   } else {
     video.hidden = true;
     download.hidden = true;
+    saved.hidden = true;
   }
   const formatted = card.querySelector('.formatted');
   formatted.textContent = block.formatted || block.formatError || 'Sin texto.';
@@ -132,11 +258,11 @@ function addBlockCard(block) {
 
 function renderSnapshot(data) {
   setStatus(data.state, data.message, data);
+  resetPlayback();
   transcript.innerHTML = '';
-  for (const clip of data.openClips || []) {
-    if (clip.text) appendTranscript(clip.index, clip.label, clip.text);
-    showPreview(clip.mediaUrl, clip.label);
-  }
+  for (const source of data.sources || []) enqueueSource(source.mediaUrl, source.label);
+  for (const clip of data.openClips || []) rememberCue(clip);
+  if (files.length) playFile(files.length - 1);
   if (!transcript.querySelector('p')) {
     transcript.innerHTML = '<p class="placeholder">La transcripción aparecerá aquí…</p>';
   }
@@ -162,11 +288,9 @@ startButton.addEventListener('click', async () => {
   blocksSection.hidden = true;
   seenBlocks.clear();
   archive.length = 0;
+  resetPlayback();
   clock.textContent = '—';
-  count.textContent = '0 clips';
-  videoFrame.classList.remove('has-video');
-  preview.removeAttribute('src');
-  previewLabel.textContent = 'Sin video';
+  count.textContent = '0 segmentos';
   setStatus('connecting', 'Buscando el primer clip…');
   try {
     await post('/api/start', { url });
@@ -241,14 +365,17 @@ events.addEventListener('status', event => {
   const data = JSON.parse(event.data);
   setStatus(data.state, data.message, data);
 });
+events.addEventListener('source', event => {
+  const data = JSON.parse(event.data);
+  enqueueSource(data.mediaUrl, data.label);
+});
 events.addEventListener('clip', event => {
   const data = JSON.parse(event.data);
-  showPreview(data.mediaUrl, data.label);
+  rememberCue(data);
   if (Number.isInteger(data.index)) count.textContent = segmentCount(data.index + 1);
 });
 events.addEventListener('transcript', event => {
-  const data = JSON.parse(event.data);
-  appendTranscript(data.index, data.label, data.text);
+  rememberCue(JSON.parse(event.data));
 });
 events.addEventListener('block', event => addBlockCard(JSON.parse(event.data)));
 events.addEventListener('silence', event => {
