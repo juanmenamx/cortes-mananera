@@ -146,18 +146,13 @@ function segmentCount(value) {
   return `${value} ${value === 1 ? 'segmento' : 'segmentos'}`;
 }
 
-function currentTranscript() {
-  const paragraphs = [...transcript.querySelectorAll('p[data-index]')];
-  if (!paragraphs.length) return '';
-  return paragraphs.map(paragraph => {
-    const heading = paragraph.querySelector(':scope > time')?.textContent || '';
-    const words = [...paragraph.querySelectorAll('.word')].map(span => {
-      const stamp = span.querySelector('time')?.textContent || '';
-      const word = [...span.childNodes].filter(node => node.nodeType === Node.TEXT_NODE).map(node => node.textContent).join(' ').trim();
-      return `[${stamp}] ${word}`;
-    });
-    return `[${heading}] ${words.join(' ')}`.trim();
-  }).join('\n\n');
+function cutPosition() {
+  const file = files[playIndex];
+  if (!file || !preview.getAttribute('src')) return null;
+  let time = Number(preview.currentTime);
+  if (!Number.isFinite(time) || time < 0) time = 0;
+  if (time > PLAYABLE_SECONDS) time = PLAYABLE_SECONDS;
+  return { mediaUrl: file.mediaUrl, time: Math.round(time * 100) / 100 };
 }
 
 function ensureTranscript() {
@@ -174,6 +169,7 @@ function mountCue(cue) {
   ensureTranscript();
   const paragraph = document.createElement('p');
   paragraph.dataset.index = String(cue.index);
+  paragraph.dataset.media = cue.sourceMediaUrl || '';
   paragraph.classList.add('pending');
   const heading = document.createElement('time');
   heading.textContent = cue.label;
@@ -181,6 +177,7 @@ function mountCue(cue) {
   for (const word of cue.words) {
     const span = document.createElement('span');
     span.className = 'word pending';
+    span.dataset.at = String(word.at);
     const stamp = document.createElement('time');
     stamp.textContent = word.clock;
     span.append(stamp, document.createTextNode(` ${word.word}`));
@@ -194,10 +191,33 @@ function mountCue(cue) {
   });
 }
 
-function takeClosedParagraphs(lastIndex) {
-  if (!Number.isInteger(lastIndex)) return;
-  for (const paragraph of [...transcript.querySelectorAll('p[data-index]')]) {
-    if (Number(paragraph.dataset.index) <= lastIndex) paragraph.remove();
+function takeClosedParagraphs(block) {
+  const cut = block?.cut;
+  if (!cut || !Number.isFinite(cut.time)) {
+    const lastIndex = block?.lastIndex;
+    if (!Number.isInteger(lastIndex)) return;
+    for (const paragraph of [...transcript.querySelectorAll('p[data-index]')]) {
+      if (Number(paragraph.dataset.index) <= lastIndex) paragraph.remove();
+    }
+  } else {
+    for (const cue of cues) {
+      const fileIndex = files.findIndex(file => file.mediaUrl === cue.sourceMediaUrl);
+      const cutIndex = files.findIndex(file => file.mediaUrl === cut.mediaUrl);
+      if (fileIndex < 0 || cutIndex < 0 || fileIndex > cutIndex) continue;
+      const keep = fileIndex < cutIndex ? [] : (cue.words || []).filter(word => word.at >= cut.time);
+      transcript.querySelector(`p[data-index="${cue.index}"]`)?.remove();
+      const archived = archive.findIndex(item => item.index === cue.index);
+      if (archived >= 0) archive.splice(archived, 1);
+      cue.mounted = false;
+      cue.words = keep.map(word => ({ ...word, shown: false }));
+      if (!keep.length) {
+        cue.mounted = true;
+        continue;
+      }
+      mountCue(cue);
+    }
+    const playing = files[playIndex];
+    if (playing) revealCues(playing.mediaUrl, preview.currentTime || 0);
   }
   if (!transcript.querySelector('p')) {
     transcript.innerHTML = '<p class="placeholder">Bloque siguiente en curso…</p>';
@@ -253,7 +273,7 @@ function addBlockCard(block) {
   formatted.textContent = block.formatted || block.formatError || 'Sin texto.';
   card.querySelector('.raw-details pre').textContent = block.rawText || '';
   blocksContainer.prepend(card);
-  takeClosedParagraphs(block.lastIndex);
+  takeClosedParagraphs(block);
 }
 
 function renderSnapshot(data) {
@@ -303,7 +323,7 @@ stopButton.addEventListener('click', async () => {
   stopButton.disabled = true;
   newBlockButton.disabled = true;
   try {
-    const result = await post('/api/stop', { transcription: currentTranscript() });
+    const result = await post('/api/stop', { cut: cutPosition() });
     if (result.block) addBlockCard(result.block);
   } catch (error) {
     setStatus('error', error.message);
@@ -313,9 +333,9 @@ stopButton.addEventListener('click', async () => {
 newBlockButton.addEventListener('click', async () => {
   newBlockButton.disabled = true;
   try {
-    const result = await post('/api/cerrar-bloque', { transcription: currentTranscript() });
+    const result = await post('/api/cerrar-bloque', { cut: cutPosition() });
     if (result.block) addBlockCard(result.block);
-    else setStatus('running', result.message || 'El bloque todavía no tiene clips.', { clock: clock.textContent });
+    else setStatus('running', result.message || 'El video todavía está en el inicio de este bloque.', { clock: clock.textContent });
   } catch (error) {
     setStatus('error', error.message);
   } finally {

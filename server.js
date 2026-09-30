@@ -242,29 +242,186 @@ function serverTranscript(clips) {
     .join('\n\n');
 }
 
-async function buildBlock(session, clips, blockNumber, editedText) {
-  const from = clips[0].from;
-  const to = clips[clips.length - 1].to;
-  const filename = `bloque-${String(blockNumber).padStart(2, '0')}-${clips[0].stamp}-${clips[clips.length - 1].toStamp}.mp4`;
+function sourceOrdinal(session, mediaUrl) {
+  return session.sources.findIndex(item => item.mediaUrl === mediaUrl);
+}
+
+function timelinePoint(session, mediaUrl, time) {
+  const index = sourceOrdinal(session, mediaUrl);
+  if (index < 0) return null;
+  return index * CLIP_STEP_SECONDS + time;
+}
+
+function clipSpan(session, clip) {
+  const start = timelinePoint(session, clip.sourceMediaUrl, clip.offset || 0);
+  if (start == null) return null;
+  return { start, end: start + (clip.duration || 0) };
+}
+
+function coverage(session) {
+  let max = 0;
+  for (const clip of session.clips) {
+    if (!clip.ready) continue;
+    const span = clipSpan(session, clip);
+    if (span) max = Math.max(max, span.end);
+  }
+  return max;
+}
+
+function pointClock(session, point) {
+  const source = session.sources[sourceOrdinal(session, point.mediaUrl)];
+  return clockAt(source.stamp, point.time);
+}
+
+function wordsText(words) {
+  return (words || []).map(word => word.word).join(' ').trim();
+}
+
+function normalizeCut(session, cut) {
+  if (!cut || typeof cut.mediaUrl !== 'string' || !Number.isFinite(Number(cut.time))) return null;
+  if (sourceOrdinal(session, cut.mediaUrl) < 0) return null;
+  const time = Math.round(Math.min(CLIP_STEP_SECONDS, Math.max(0, Number(cut.time))) * 100) / 100;
+  return { mediaUrl: cut.mediaUrl, time };
+}
+
+function endOfOpenContent(session) {
+  let best = null;
+  for (const clip of session.clips) {
+    if (!clip.ready || clip.blockNumber != null) continue;
+    const span = clipSpan(session, clip);
+    if (!span || (best && span.end <= best.point)) continue;
+    best = {
+      mediaUrl: clip.sourceMediaUrl,
+      time: Math.round((clip.offset + clip.duration) * 100) / 100,
+      point: span.end
+    };
+  }
+  return best;
+}
+
+function splitClipAt(session, clip, localTime) {
+  const headDuration = Math.round((localTime - clip.offset) * 100) / 100;
+  const tailDuration = Math.round((clip.duration - headDuration) * 100) / 100;
+  const endClock = clockAt(clip.stamp, headDuration);
+  const headWords = (clip.words || []).filter(word => word.at < localTime);
+  const tailWords = (clip.words || []).filter(word => word.at >= localTime);
+  clip.duration = headDuration;
+  clip.to = endClock;
+  clip.words = headWords;
+  clip.text = wordsText(headWords);
+  clip.label = `${clip.from}–${clip.to}`;
+  const remainder = {
+    index: session.clips.length,
+    stamp: clip.stamp,
+    toStamp: clip.toStamp,
+    from: endClock,
+    to: clockAt(clip.stamp, headDuration + tailDuration),
+    label: '',
+    url: clip.url,
+    filename: clip.filename,
+    file: clip.file,
+    text: wordsText(tailWords),
+    words: tailWords,
+    offset: Math.round(localTime * 100) / 100,
+    duration: tailDuration,
+    sourceMediaUrl: clip.sourceMediaUrl,
+    ready: true,
+    blockNumber: null
+  };
+  remainder.label = `${remainder.from}–${remainder.to}`;
+  session.clips.push(remainder);
+  return remainder;
+}
+
+function localTime(session, clip, point) {
+  return point - sourceOrdinal(session, clip.sourceMediaUrl) * CLIP_STEP_SECONDS;
+}
+
+function collectBlockClips(session, start, end) {
+  const startPoint = timelinePoint(session, start.mediaUrl, start.time);
+  const endPoint = timelinePoint(session, end.mediaUrl, end.time);
+  const chosen = [];
+  for (const clip of session.clips.filter(item => item.ready && item.blockNumber == null)) {
+    const span = clipSpan(session, clip);
+    if (!span || span.end <= startPoint + 0.04 || span.start >= endPoint - 0.04) continue;
+    let piece = clip;
+    if (span.start < startPoint - 0.04) {
+      splitClipAt(session, clip, localTime(session, clip, startPoint));
+      clip.blockNumber = -1;
+      piece = session.clips[session.clips.length - 1];
+    }
+    const pieceSpan = clipSpan(session, piece);
+    if (pieceSpan.end > endPoint + 0.04) splitClipAt(session, piece, localTime(session, piece, endPoint));
+    if ((piece.duration || 0) < 0.04 && !(piece.words || []).length) continue;
+    chosen.push(piece);
+  }
+  chosen.sort((a, b) => clipSpan(session, a).start - clipSpan(session, b).start);
+  return chosen;
+}
+
+async function renderRange(session, start, end, output) {
+  const startIndex = sourceOrdinal(session, start.mediaUrl);
+  const endIndex = sourceOrdinal(session, end.mediaUrl);
+  const pieces = [];
+  for (let index = startIndex; index <= endIndex; index += 1) {
+    const source = session.sources[index];
+    const from = index === startIndex ? start.time : 0;
+    const to = index === endIndex ? end.time : CLIP_STEP_SECONDS;
+    const duration = Math.round((to - from) * 100) / 100;
+    if (duration < 0.08) continue;
+    const piece = output.replace(/\.mp4$/i, `-parte-${pieces.length}.mp4`);
+    await cutSegment(source.file, piece, from, duration);
+    pieces.push(piece);
+  }
+  if (!pieces.length) throw new Error('El corte no incluye video.');
+  if (pieces.length === 1) {
+    fs.copyFileSync(pieces[0], output);
+    return;
+  }
+  const listPath = output.replace(/\.mp4$/i, '-list.txt');
+  fs.writeFileSync(listPath, pieces.map(file => `file '${file.replace(/\\/g, '/')}'`).join('\n'));
+  try {
+    await run(FFMPEG, ['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', '-movflags', '+faststart', output]);
+  } finally {
+    fs.rmSync(listPath, { force: true });
+  }
+}
+
+async function waitUntilCovered(session, endPoint) {
+  session.pause = true;
+  while (session.busy) await sleep(40);
+  if (session.stopping || coverage(session) + 0.05 >= endPoint) return;
+  session.pause = false;
+  while (!session.stopping && coverage(session) + 0.05 < endPoint) await sleep(40);
+  session.pause = true;
+  while (session.busy) await sleep(40);
+}
+
+async function buildBlock(session, clips, blockNumber, editedText, range) {
+  const from = pointClock(session, range.start);
+  const to = pointClock(session, range.end);
+  const filename = `bloque-${String(blockNumber).padStart(2, '0')}-${from.replace(/[:.]/g, '')}-${to.replace(/[:.]/g, '')}.mp4`;
   const output = path.join(session.dir, 'cortes', filename);
-  const rawText = String(editedText || '').trim() || serverTranscript(clips);
+  const rawText = serverTranscript(clips).trim() || String(editedText || '').trim();
+  const rangeSource = session.sources[sourceOrdinal(session, range.start.mediaUrl)];
   const block = {
     blockNumber,
     from,
     to,
     label: `${from}–${to}`,
     clipCount: clips.length,
-    lastIndex: clips[clips.length - 1].index,
+    lastIndex: clips.length ? clips[clips.length - 1].index : -1,
     rawText,
     formatted: '',
     formatError: '',
     videoUrl: '',
     savedPath: '',
+    cut: range.end,
     cutError: ''
   };
 
   const tasks = [
-    cutVideos(clips, output).then(() => {
+    renderRange(session, range.start, range.end, output).then(() => {
       block.videoUrl = mediaUrl(session.id, 'cortes', filename);
       block.savedPath = publishCut(output, filename);
     }).catch(error => {
@@ -277,8 +434,8 @@ async function buildBlock(session, clips, blockNumber, editedText) {
     tasks.push(formatBlock({
       transcription: rawText,
       blockNumber,
-      sourceUrl: clips[0].url,
-      stamp: clips[0].stamp
+      sourceUrl: clips[0]?.url || '',
+      stamp: clips[0]?.stamp || rangeSource.stamp
     }).then(text => {
       block.formatted = text;
     }).catch(error => {
@@ -293,19 +450,28 @@ async function buildBlock(session, clips, blockNumber, editedText) {
   return block;
 }
 
-async function closeBlock(session, editedText) {
+async function closeBlock(session, editedText, cutInput) {
   return session.exclusive(async () => {
-    session.pause = true;
-    while (session.busy) await sleep(40);
-    const clips = session.clips.filter(clip => clip.ready && clip.blockNumber == null);
-    session.pause = false;
-    if (!clips.length) return null;
-    const blockNumber = session.nextBlock;
-    session.nextBlock += 1;
-    for (const clip of clips) clip.blockNumber = blockNumber;
-    const block = await buildBlock(session, clips, blockNumber, editedText);
-    session.blocks.push(block);
-    return block;
+    try {
+      if (!session.rangeStart && session.sources[0]) session.rangeStart = { mediaUrl: session.sources[0].mediaUrl, time: 0 };
+      const start = session.rangeStart;
+      const end = normalizeCut(session, cutInput) || endOfOpenContent(session);
+      if (!start || !end) return null;
+      const startPoint = timelinePoint(session, start.mediaUrl, start.time);
+      const endPoint = timelinePoint(session, end.mediaUrl, end.time);
+      if (startPoint == null || endPoint == null || endPoint - startPoint < 0.08) return null;
+      await waitUntilCovered(session, endPoint);
+      const clips = collectBlockClips(session, start, end);
+      const blockNumber = session.nextBlock;
+      session.nextBlock += 1;
+      for (const clip of clips) clip.blockNumber = blockNumber;
+      const block = await buildBlock(session, clips, blockNumber, editedText, { start, end });
+      session.blocks.push(block);
+      session.rangeStart = end;
+      return block;
+    } finally {
+      if (!session.stopping) session.pause = false;
+    }
   });
 }
 
@@ -334,6 +500,7 @@ async function publishSegment(session, source, fileStamp, url, sourceFile, sourc
     text: '',
     words: [],
     offset: part.offset,
+    duration: part.duration,
     sourceMediaUrl,
     ready: false,
     blockNumber: null
@@ -384,7 +551,8 @@ async function ingestClip(session, source, stamp) {
   sendEvent('status', { state: 'running', message: session.message, clock: label, count: session.clips.length });
   await downloadClip(url, sourceFile);
   const sourceMediaUrl = mediaUrl(session.id, 'clips', sourceName);
-  session.sources.push({ mediaUrl: sourceMediaUrl, label });
+  session.sources.push({ mediaUrl: sourceMediaUrl, label, file: sourceFile, stamp });
+  if (!session.rangeStart) session.rangeStart = { mediaUrl: sourceMediaUrl, time: 0 };
   session.previewUrl = sourceMediaUrl;
   sendEvent('source', { mediaUrl: sourceMediaUrl, label, playableSeconds: CLIP_STEP_SECONDS });
 
@@ -469,6 +637,8 @@ async function startSession(clipUrl) {
     clock: rangeLabel(source.stamp),
     previewUrl: '',
     sources: [],
+    rangeStart: null,
+    pendingCut: null,
     finalBlock: null,
     exclusive: createLock()
   };
@@ -481,14 +651,14 @@ async function startSession(clipUrl) {
     try {
       await runLoop(session, source);
       if (!session.stopReason) session.stopReason = 'ended';
-      session.finalBlock = await closeBlock(session, session.pendingText);
+      session.finalBlock = await closeBlock(session, session.pendingText, session.pendingCut);
       if (session.finalBlock && session.stopReason === 'ended') sendEvent('block', session.finalBlock);
     } catch (error) {
       failed = true;
       const message = publicError(error);
       log('La captura terminó con error', { message });
       try {
-        session.finalBlock = await closeBlock(session, session.pendingText);
+        session.finalBlock = await closeBlock(session, session.pendingText, session.pendingCut);
         if (session.finalBlock) sendEvent('block', session.finalBlock);
       } catch (cutError) {
         log('No se pudo cerrar el bloque tras el error', { message: publicError(cutError) });
@@ -572,6 +742,7 @@ const server = http.createServer(async (request, response) => {
       const body = JSON.parse(await collectBody(request) || '{}');
       const session = active;
       session.pendingText = body.transcription;
+      session.pendingCut = body.cut;
       session.stopReason = 'stopped';
       session.stopping = true;
       await session.done;
@@ -581,7 +752,7 @@ const server = http.createServer(async (request, response) => {
     if (request.method === 'POST' && request.url === '/api/cerrar-bloque') {
       if (!active) return json(response, 400, { error: 'No hay una captura en curso.' });
       const body = JSON.parse(await collectBody(request) || '{}');
-      const block = await closeBlock(active, body.transcription);
+      const block = await closeBlock(active, body.transcription, body.cut);
       if (!block) return json(response, 200, { block: null, message: 'El bloque todavía no tiene clips.' });
       return json(response, 200, { block });
     }
