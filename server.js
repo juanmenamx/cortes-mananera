@@ -21,7 +21,7 @@ loadEnv(path.join(__dirname, '.env'));
 loadEnv(path.join(__dirname, '..', 'transcriptor-mananera', '.env'), ['PORT']);
 loadEnv(path.join(__dirname, '..', 'news-notas-ai', '.env'), ['PORT']);
 
-const { assertTranscriptionReady, formatBlock, looksLikeHallucination, transcribe } = require('./lib/transcribe');
+const { assertTranscriptionReady, extractPeople, formatBlock, looksLikeHallucination, mergeRosters, transcribe } = require('./lib/transcribe');
 
 const PORT = Number(process.env.PORT || 4311);
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -254,15 +254,11 @@ async function cutVideos(clips, output) {
   }
 }
 
-function timedText(clip) {
-  if (clip.words?.length) return clip.words.map(word => `[${word.clock}] ${word.word}`).join(' ');
-  return clip.text;
-}
-
 function serverTranscript(clips) {
   return clips
     .filter(clip => clip.text)
-    .map(clip => `[${clip.label}] ${timedText(clip)}`)
+    .map(clip => clip.text.trim())
+    .filter(Boolean)
     .join('\n\n');
 }
 
@@ -621,21 +617,45 @@ async function buildBlock(session, clips, blockNumber, editedText, range) {
   })());
 
   if (rawText) {
-    tasks.push(formatBlock({
-      transcription: rawText,
-      blockNumber,
-      sourceUrl: clips[0]?.url || '',
-      stamp: clips[0]?.stamp || rangeSource.stamp,
-      mode: session.cutMode
-    }).then(result => {
-      block.formatted = result.text;
-      block.funcionarios = result.funcionarios;
-      block.reportero = result.reportero;
-      if (blockNumber === 1) log('Participantes presentados en el primer bloque', { cantidad: result.funcionarios.length });
-    }).catch(error => {
-      block.formatError = publicError(error);
-      log('No se pudo formatear el bloque', { blockNumber, message: error.message });
-    }));
+    tasks.push((async () => {
+      const wantRoster = blockNumber === 1 || session.cutMode?.kind === 'pregunta';
+      const [rosterResult, formatResult] = await Promise.all([
+        wantRoster
+          ? extractPeople({ transcription: rawText, blockNumber, mode: session.cutMode }).catch(error => {
+            log('No se pudieron rescatar las personas', { blockNumber, message: publicError(error) });
+            return { funcionarios: [], reporteros: [] };
+          })
+          : Promise.resolve({ funcionarios: [], reporteros: [] }),
+        formatBlock({
+          transcription: rawText,
+          blockNumber,
+          sourceUrl: clips[0]?.url || '',
+          stamp: clips[0]?.stamp || rangeSource.stamp,
+          mode: session.cutMode
+        }).then(result => ({ ok: true, result })).catch(error => {
+          block.formatError = publicError(error);
+          log('No se pudo formatear el bloque', { blockNumber, message: error.message });
+          return { ok: false, roster: error.roster || { funcionarios: [], reporteros: [] } };
+        })
+      ]);
+      const fromFormat = formatResult.ok ? formatResult.result : formatResult.roster;
+      const people = mergeRosters(rosterResult, fromFormat);
+      block.funcionarios = people.funcionarios;
+      block.reporteros = people.reporteros;
+      block.reportero = people.reportero;
+      if (formatResult.ok) {
+        let formatted = formatResult.result.text;
+        const reporter = people.reporteros[0];
+        if (session.cutMode?.kind === 'pregunta' && reporter) {
+          formatted = formatted
+            .replaceAll('Reportero: [nombre]', `Reportero: ${reporter.nombre}`)
+            .replaceAll('Medio: [medio]', `Medio: ${reporter.medio || '[medio]'}`);
+        }
+        block.formatted = formatted;
+      }
+      if (blockNumber === 1) log('Funcionarios del primer bloque', { personas: people.funcionarios });
+      if (session.cutMode?.kind === 'pregunta') log('Reporteros de la pregunta', { personas: people.reporteros });
+    })());
   } else {
     block.formatted = 'Este bloque no contiene voz transcrita.';
   }

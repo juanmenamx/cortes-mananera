@@ -273,7 +273,10 @@ function cutMode() {
 
 function absorbPeople(block) {
   if (Array.isArray(block?.funcionarios)) mergePeople(participants, 'cargo', block.funcionarios);
-  if (block?.reportero) mergePeople(reporters, 'medio', [block.reportero]);
+  const reporteros = Array.isArray(block?.reporteros) && block.reporteros.length
+    ? block.reporteros
+    : (block?.reportero ? [block.reportero] : []);
+  if (reporteros.length) mergePeople(reporters, 'medio', reporteros);
 }
 
 function cutPosition() {
@@ -317,7 +320,7 @@ function mountCue(cue) {
   archive.push({
     index: cue.index,
     label: cue.label,
-    text: cue.words.map(word => `[${word.clock}] ${word.word}`).join(' ')
+    text: cue.words.map(word => word.word).join(' ')
   });
 }
 
@@ -352,6 +355,14 @@ function takeClosedParagraphs(block) {
   if (!transcript.querySelector('p')) {
     transcript.innerHTML = '<p class="placeholder">Bloque siguiente en curso…</p>';
   }
+}
+
+function plainTranscript(text) {
+  return String(text || '')
+    .replace(/\[[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{2})?(?:–[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{2})?)?\]\s*/g, '')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 function cutFactsText(block) {
@@ -430,7 +441,7 @@ function addBlockCard(block) {
   }
   const formatted = card.querySelector('.formatted');
   formatted.textContent = block.formatted || block.formatError || 'Sin texto.';
-  card.querySelector('.raw-details pre').textContent = block.rawText || '';
+  card.querySelector('.raw-details pre').textContent = plainTranscript(block.rawText);
   blocksContainer.prepend(card);
   takeClosedParagraphs(block);
 }
@@ -556,7 +567,7 @@ copyButton.addEventListener('click', async () => {
 
 downloadButton.addEventListener('click', () => {
   if (!archive.length) return;
-  const cleanText = archive.map(item => `[${item.label}] ${item.text}`).join('\n\n');
+  const cleanText = archive.map(item => item.text).join('\n\n');
   const blob = new Blob([`${cleanText}\n`], { type: 'text/plain;charset=utf-8' });
   const link = document.createElement('a');
   link.href = URL.createObjectURL(blob);
