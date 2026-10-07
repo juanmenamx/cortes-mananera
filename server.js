@@ -213,7 +213,11 @@ async function downloadClip(url, dest) {
   const type = (response.headers.get('content-type') || '').toLowerCase();
   if (!response.ok || !type.includes('video/')) throw new Error('El clip dejó de estar disponible al descargarlo.');
   const bytes = Buffer.from(await response.arrayBuffer());
-  if (bytes.length < 1000) throw new Error('El clip llegó vacío.');
+  const expected = Number(response.headers.get('content-length'));
+  const incomplete = bytes.length < 1000
+    || (Number.isFinite(expected) && expected > bytes.length)
+    || !bytes.includes(Buffer.from('moov'));
+  if (incomplete) throw new Error('El clip todavía se está grabando.');
   fs.writeFileSync(dest, bytes);
 }
 
@@ -537,13 +541,14 @@ async function renderRange(session, start, end, output) {
 }
 
 async function waitUntilCovered(session, endPoint) {
+  const deadline = Date.now() + 12000;
   session.pause = true;
-  while (session.busy) await sleep(40);
+  while (session.busy && !session.stopping) await sleep(40);
   if (session.stopping || coverage(session) + 0.05 >= endPoint) return;
   session.pause = false;
-  while (!session.stopping && coverage(session) + 0.05 < endPoint) await sleep(40);
+  while (!session.stopping && coverage(session) + 0.05 < endPoint && Date.now() < deadline) await sleep(40);
   session.pause = true;
-  while (session.busy) await sleep(40);
+  while (session.busy && !session.stopping) await sleep(40);
 }
 
 async function buildBlock(session, clips, blockNumber, editedText, range) {
@@ -620,9 +625,13 @@ async function buildBlock(session, clips, blockNumber, editedText, range) {
       transcription: rawText,
       blockNumber,
       sourceUrl: clips[0]?.url || '',
-      stamp: clips[0]?.stamp || rangeSource.stamp
-    }).then(text => {
-      block.formatted = text;
+      stamp: clips[0]?.stamp || rangeSource.stamp,
+      mode: session.cutMode
+    }).then(result => {
+      block.formatted = result.text;
+      block.funcionarios = result.funcionarios;
+      block.reportero = result.reportero;
+      if (blockNumber === 1) log('Participantes presentados en el primer bloque', { cantidad: result.funcionarios.length });
     }).catch(error => {
       block.formatError = publicError(error);
       log('No se pudo formatear el bloque', { blockNumber, message: error.message });
@@ -635,24 +644,54 @@ async function buildBlock(session, clips, blockNumber, editedText, range) {
   return block;
 }
 
-async function closeBlock(session, editedText, cutInput) {
+function normalizeMode(mode) {
+  if (!mode) return { kind: 'participacion', speaker: { nombre: '', cargo: '', medio: '' }, participantes: [], reporteros: [] };
+  const kind = mode?.kind === 'pregunta' ? 'pregunta' : 'participacion';
+  const speaker = {
+    nombre: String(mode?.speaker?.nombre || '').trim(),
+    cargo: String(mode?.speaker?.cargo || '').trim(),
+    medio: String(mode?.speaker?.medio || '').trim()
+  };
+  const clean = list => (Array.isArray(list) ? list : [])
+    .map(person => ({
+      nombre: String(person?.nombre || '').trim(),
+      cargo: String(person?.cargo || '').trim(),
+      medio: String(person?.medio || '').trim()
+    }))
+    .filter(person => person.nombre);
+  return { kind, speaker, participantes: clean(mode?.participantes), reporteros: clean(mode?.reporteros) };
+}
+
+async function closeBlock(session, editedText, cutInput, mode) {
   return session.exclusive(async () => {
     try {
       if (!session.rangeStart && session.sources[0]) session.rangeStart = { mediaUrl: session.sources[0].mediaUrl, time: 0 };
       const start = session.rangeStart;
-      const end = normalizeCut(session, cutInput) || endOfOpenContent(session);
-      if (!start || !end) return null;
+      let end = normalizeCut(session, cutInput) || endOfOpenContent(session);
+      if (!start || !end) {
+        log('No hubo video abierto para cerrar el bloque');
+        return null;
+      }
       const startPoint = timelinePoint(session, start.mediaUrl, start.time);
-      const endPoint = timelinePoint(session, end.mediaUrl, end.time);
+      let endPoint = timelinePoint(session, end.mediaUrl, end.time);
       if (startPoint == null || endPoint == null || endPoint - startPoint < 0.08) return null;
       await waitUntilCovered(session, endPoint);
+      if (coverage(session) + 0.05 < endPoint) {
+        const fallback = endOfOpenContent(session);
+        if (!fallback || fallback.point - startPoint < 0.08) return null;
+        end = { mediaUrl: fallback.mediaUrl, time: fallback.time };
+      }
+      log('Cerrando bloque', { numero: session.nextBlock, marcas: `${start.time}->${end.time}` });
       const clips = collectBlockClips(session, start, end);
+      session.cutMode = normalizeMode(mode);
       const blockNumber = session.nextBlock;
       session.nextBlock += 1;
       for (const clip of clips) clip.blockNumber = blockNumber;
       const block = await buildBlock(session, clips, blockNumber, editedText, { start, end });
       session.blocks.push(block);
       session.rangeStart = end;
+      sendEvent('block', block);
+      log('Bloque listo', { numero: block.blockNumber, nota: block.nota || block.noteError || 'sin nota' });
       return block;
     } finally {
       if (!session.stopping) session.pause = false;
@@ -764,6 +803,7 @@ async function ingestClip(session, source, stamp) {
 
 async function runLoop(session, source) {
   const seen = new Set();
+  const waiting = new Set();
   let lastStamp = source.stamp;
   let caughtUp = false;
   while (!session.stopping) {
@@ -800,24 +840,40 @@ async function runLoop(session, source) {
       await sleep(POLL_MS);
       continue;
     }
+    let retry = false;
     for (const item of pending) {
       while (session.pause && !session.stopping) await sleep(40);
       if (session.stopping) return;
-      seen.add(item.url);
       const parsed = parseClipUrl(item.url);
       if (!parsed) {
+        seen.add(item.url);
         log('Se omitió un bloque de 30 segundos sin liga válida', { url: item.url });
         continue;
       }
-      lastStamp = parsed.stamp;
       try {
         await ingestClip(session, parsed, parsed.stamp);
+        seen.add(item.url);
+        waiting.delete(item.url);
+        lastStamp = parsed.stamp;
       } catch (error) {
         if (isAuthError(error)) throw error;
-        log('No se pudo incorporar el clip', { stamp: parsed.stamp, message: publicError(error) });
-        sendEvent('notice', { message: `Se omitió el clip de las ${clock(parsed.stamp)}.` });
+        const newer = bloques.some(other => other.url !== item.url && !seen.has(other.url) && String(other.inicio) > String(item.inicio));
+        if (newer) {
+          seen.add(item.url);
+          log('Se omitió un bloque de 30 segundos incompleto', { stamp: parsed.stamp, message: publicError(error) });
+          continue;
+        }
+        if (!waiting.has(item.url)) {
+          waiting.add(item.url);
+          log('El bloque de 30 segundos todavía no está listo', { stamp: parsed.stamp, message: publicError(error) });
+        }
+        session.message = 'Esperando a que termine de grabarse el bloque de 30 segundos';
+        sendEvent('status', { state: 'running', message: session.message, clock: session.clock, count: session.clips.length });
+        retry = true;
+        break;
       }
     }
+    if (retry) await sleep(POLL_MS);
   }
 }
 
@@ -881,14 +937,14 @@ async function startSession(clipUrl) {
     try {
       await runLoop(session, source);
       if (!session.stopReason) session.stopReason = 'ended';
-      session.finalBlock = await closeBlock(session, session.pendingText, session.pendingCut);
+      session.finalBlock = await closeBlock(session, session.pendingText, session.pendingCut, session.pendingMode);
       if (session.finalBlock && session.stopReason === 'ended') sendEvent('block', session.finalBlock);
     } catch (error) {
       failed = true;
       const message = publicError(error);
       log('La captura terminó con error', { message });
       try {
-        session.finalBlock = await closeBlock(session, session.pendingText, session.pendingCut);
+        session.finalBlock = await closeBlock(session, session.pendingText, session.pendingCut, session.pendingMode);
         if (session.finalBlock) sendEvent('block', session.finalBlock);
       } catch (cutError) {
         log('No se pudo cerrar el bloque tras el error', { message: publicError(cutError) });
@@ -971,10 +1027,13 @@ const server = http.createServer(async (request, response) => {
       if (!active) return json(response, 200, { ok: true, block: null });
       const body = JSON.parse(await collectBody(request) || '{}');
       const session = active;
+      log('Deteniendo captura');
       session.pendingText = body.transcription;
       session.pendingCut = body.cut;
+      session.pendingMode = body.mode;
       session.stopReason = 'stopped';
       session.stopping = true;
+      session.pause = false;
       await session.done;
       return json(response, 200, { ok: true, block: session.finalBlock });
     }
@@ -982,7 +1041,7 @@ const server = http.createServer(async (request, response) => {
     if (request.method === 'POST' && request.url === '/api/cerrar-bloque') {
       if (!active) return json(response, 400, { error: 'No hay una captura en curso.' });
       const body = JSON.parse(await collectBody(request) || '{}');
-      const block = await closeBlock(active, body.transcription, body.cut);
+      const block = await closeBlock(active, body.transcription, body.cut, body.mode);
       if (!block) return json(response, 200, { block: null, message: 'El bloque todavía no tiene clips.' });
       return json(response, 200, { block });
     }

@@ -9,6 +9,19 @@ const copyButton = document.querySelector('#copy');
 const downloadButton = document.querySelector('#download');
 const clearButton = document.querySelector('#clear');
 const newBlockButton = document.querySelector('#new-block');
+const participants = document.querySelector('#participants');
+const reporters = document.querySelector('#reporters');
+const participantsGroup = document.querySelector('#participants-group');
+const reportersGroup = document.querySelector('#reporters-group');
+const addParticipantButton = document.querySelector('#add-participant');
+const addReporterButton = document.querySelector('#add-reporter');
+const kindParticipacion = document.querySelector('#kind-participacion');
+const kindPregunta = document.querySelector('#kind-pregunta');
+const peopleHint = document.querySelector('#people-hint');
+const clearSelectionButton = document.querySelector('#clear-selection');
+const cutError = document.querySelector('#cut-error');
+const listening = document.querySelector('#listening');
+let cutKind = 'participacion';
 const blocksSection = document.querySelector('#blocks-section');
 const blocksContainer = document.querySelector('#blocks');
 const preview = document.querySelector('#preview');
@@ -50,27 +63,29 @@ function playFile(index) {
   const file = files[index];
   if (!file) return;
   playIndex = index;
-  advancing = false;
+  advancing = true;
   delete preview.dataset.stalled;
   previewLabel.textContent = file.label || 'Clip';
   videoFrame.classList.add('has-video');
   preview.src = file.mediaUrl;
   revealCues(file.mediaUrl, 0);
   for (const earlier of files.slice(0, index)) revealCues(earlier.mediaUrl, PLAYABLE_SECONDS);
+  const release = () => { advancing = false; };
   const started = preview.play();
-  if (started) started.catch(() => {});
+  if (started) started.then(release, release);
+  else release();
 }
 
 function advancePlayback() {
   if (advancing) return;
-  advancing = true;
   const file = files[playIndex];
   if (file) revealCues(file.mediaUrl, PLAYABLE_SECONDS);
-  if (files[playIndex + 1]) playFile(playIndex + 1);
-  else {
-    advancing = false;
-    preview.dataset.stalled = '1';
+  if (files[playIndex + 1]) {
+    playFile(playIndex + 1);
+    return;
   }
+  preview.dataset.stalled = '1';
+  if (preview.currentTime >= PLAYABLE_SECONDS) preview.pause();
 }
 
 function revealCues(mediaUrl, time) {
@@ -123,7 +138,9 @@ preview.addEventListener('timeupdate', () => {
   }
   revealCues(file.mediaUrl, preview.currentTime);
 });
-preview.addEventListener('ended', () => advancePlayback());
+preview.addEventListener('ended', () => {
+  if (!advancing) advancePlayback();
+});
 
 function setStatus(state, message, meta = {}) {
   running = state === 'running' || state === 'connecting';
@@ -136,12 +153,127 @@ function setStatus(state, message, meta = {}) {
   startButton.disabled = running;
   stopButton.disabled = !running;
   newBlockButton.disabled = !running;
+  listening.hidden = state !== 'running';
   if (meta.clock) clock.textContent = meta.clock;
   if (Number.isInteger(meta.count)) count.textContent = segmentCount(meta.count);
 }
 
 function segmentCount(value) {
   return `${value} ${value === 1 ? 'segmento' : 'segmentos'}`;
+}
+
+function addPerson(container, fields, values = {}) {
+  const row = document.createElement('div');
+  row.className = 'person';
+  const check = document.createElement('button');
+  check.type = 'button';
+  check.className = 'person-check';
+  check.setAttribute('aria-label', 'Seleccionar');
+  check.append(document.createElement('span'));
+  const fieldsBox = document.createElement('div');
+  fieldsBox.className = 'person-fields';
+  for (const field of fields) {
+    const input = document.createElement('input');
+    input.dataset.field = field;
+    input.placeholder = field === 'nombre' ? 'Nombre' : field === 'cargo' ? 'Cargo' : 'Medio';
+    input.value = values[field] || '';
+    fieldsBox.append(input);
+  }
+  const remove = document.createElement('button');
+  remove.type = 'button';
+  remove.className = 'danger remove-person';
+  remove.textContent = 'Quitar';
+  row.append(check, fieldsBox, remove);
+  container.append(row);
+}
+
+function readPeople(container, extraField) {
+  return [...container.querySelectorAll('.person')].map(row => ({
+    nombre: row.querySelector('[data-field="nombre"]').value.trim(),
+    [extraField]: row.querySelector(`[data-field="${extraField}"]`).value.trim()
+  })).filter(person => person.nombre);
+}
+
+function mergePeople(container, extraField, incoming) {
+  for (const person of incoming || []) {
+    const nombre = String(person?.nombre || '').trim();
+    const extra = String(person[extraField] || '').trim();
+    if (!nombre) continue;
+    const rows = [...container.querySelectorAll('.person')];
+    const same = rows.find(row => {
+      const current = row.querySelector('[data-field="nombre"]').value.trim();
+      return current.localeCompare(nombre, 'es', { sensitivity: 'base' }) === 0;
+    });
+    if (same) {
+      const field = same.querySelector(`[data-field="${extraField}"]`);
+      if (field && !field.value.trim() && extra) field.value = extra;
+      continue;
+    }
+    const blank = rows.find(row => !row.querySelector('[data-field="nombre"]').value.trim());
+    if (blank) {
+      blank.querySelector('[data-field="nombre"]').value = nombre;
+      blank.querySelector(`[data-field="${extraField}"]`).value = extra;
+      continue;
+    }
+    addPerson(container, ['nombre', extraField], { nombre, [extraField]: extra });
+  }
+}
+
+function activeList() {
+  return cutKind === 'pregunta' ? reporters : participants;
+}
+
+function personFromRow(row, extraField) {
+  const nombre = row.querySelector('[data-field="nombre"]').value.trim();
+  if (!nombre) return null;
+  return {
+    nombre,
+    [extraField]: row.querySelector(`[data-field="${extraField}"]`).value.trim()
+  };
+}
+
+function selectedSpeaker() {
+  const row = activeList().querySelector('.person.selected');
+  if (!row) return null;
+  return personFromRow(row, cutKind === 'pregunta' ? 'medio' : 'cargo');
+}
+
+function pickSpeaker() {
+  if (selectedSpeaker()) return;
+  const extra = cutKind === 'pregunta' ? 'medio' : 'cargo';
+  const rows = [...activeList().querySelectorAll('.person')].filter(row => personFromRow(row, extra));
+  if (rows.length === 1) selectPerson(rows[0]);
+}
+
+function selectPerson(row) {
+  const list = row.closest('.people-list');
+  list.querySelectorAll('.person.selected').forEach(item => item.classList.remove('selected'));
+  row.classList.add('selected');
+}
+
+function setCutKind(kind) {
+  cutKind = kind === 'pregunta' ? 'pregunta' : 'participacion';
+  kindParticipacion.classList.toggle('active', cutKind === 'participacion');
+  kindPregunta.classList.toggle('active', cutKind === 'pregunta');
+  participantsGroup.classList.toggle('is-target', cutKind === 'participacion');
+  reportersGroup.classList.toggle('is-target', cutKind === 'pregunta');
+  peopleHint.innerHTML = cutKind === 'pregunta'
+    ? '<strong>¿Quién hace la pregunta?</strong> Corrige nombre o medio si es necesario y selecciona al reportero antes de finalizar.'
+    : '<strong>¿Quién o quiénes participaron en este bloque?</strong> Corrige nombre o cargo si es necesario y selecciona antes de finalizar.';
+}
+
+function cutMode() {
+  return {
+    kind: cutKind,
+    speaker: selectedSpeaker(),
+    participantes: readPeople(participants, 'cargo'),
+    reporteros: readPeople(reporters, 'medio')
+  };
+}
+
+function absorbPeople(block) {
+  if (Array.isArray(block?.funcionarios)) mergePeople(participants, 'cargo', block.funcionarios);
+  if (block?.reportero) mergePeople(reporters, 'medio', [block.reportero]);
 }
 
 function cutPosition() {
@@ -313,7 +445,10 @@ function renderSnapshot(data) {
   if (!transcript.querySelector('p')) {
     transcript.innerHTML = '<p class="placeholder">La transcripción aparecerá aquí…</p>';
   }
-  for (const block of data.blocks || []) addBlockCard(block);
+  for (const block of data.blocks || []) {
+    absorbPeople(block);
+    addBlockCard(block);
+  }
 }
 
 async function post(endpoint, body) {
@@ -344,29 +479,73 @@ startButton.addEventListener('click', async () => {
   }
 });
 
-stopButton.addEventListener('click', async () => {
+function showCutError(message) {
+  cutError.hidden = !message;
+  cutError.textContent = message || '';
+}
+
+function revealBlock(block) {
+  showCutError('');
+  absorbPeople(block);
+  addBlockCard(block);
+  blocksSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+async function stopSession() {
+  pickSpeaker();
+  stopButton.disabled = true;
+  newBlockButton.disabled = true;
+  setStatus('connecting', 'Deteniendo y generando la nota…');
   stopButton.disabled = true;
   newBlockButton.disabled = true;
   try {
-    const result = await post('/api/stop', { cut: cutPosition() });
-    if (result.block) addBlockCard(result.block);
+    const result = await post('/api/stop', { cut: cutPosition(), mode: cutMode() });
+    if (result.block) revealBlock(result.block);
+    else showCutError('La captura se detuvo, pero este tramo no tenía video para armar el bloque.');
   } catch (error) {
+    showCutError(error.message);
     setStatus('error', error.message);
   }
-});
+}
+
+stopButton.addEventListener('click', stopSession);
 
 newBlockButton.addEventListener('click', async () => {
+  pickSpeaker();
+  newBlockButton.disabled = true;
+  setStatus('running', 'Cortando el bloque y generando la nota…', { clock: clock.textContent });
   newBlockButton.disabled = true;
   try {
-    const result = await post('/api/cerrar-bloque', { cut: cutPosition() });
-    if (result.block) addBlockCard(result.block);
-    else setStatus('running', result.message || 'El video todavía está en el inicio de este bloque.', { clock: clock.textContent });
+    const result = await post('/api/cerrar-bloque', { cut: cutPosition(), mode: cutMode() });
+    if (result.block) revealBlock(result.block);
+    else showCutError(result.message || 'El video todavía está en el inicio de este bloque.');
   } catch (error) {
+    showCutError(error.message);
     setStatus('error', error.message);
   } finally {
     if (running) newBlockButton.disabled = false;
   }
 });
+
+kindParticipacion.addEventListener('click', () => setCutKind('participacion'));
+kindPregunta.addEventListener('click', () => setCutKind('pregunta'));
+addParticipantButton.addEventListener('click', () => addPerson(participants, ['nombre', 'cargo']));
+addReporterButton.addEventListener('click', () => addPerson(reporters, ['nombre', 'medio']));
+document.addEventListener('click', event => {
+  const button = event.target.closest('.remove-person');
+  if (button) {
+    button.closest('.person').remove();
+    return;
+  }
+  if (event.target.closest('input')) return;
+  const row = event.target.closest('.person');
+  if (row) selectPerson(row);
+});
+clearSelectionButton.addEventListener('click', () => {
+  activeList().querySelectorAll('.person.selected').forEach(item => item.classList.remove('selected'));
+});
+addPerson(participants, ['nombre', 'cargo']);
+addPerson(reporters, ['nombre', 'medio']);
 
 copyButton.addEventListener('click', async () => {
   await navigator.clipboard.writeText(transcript.innerText.trim());
@@ -425,7 +604,11 @@ events.addEventListener('clip', event => {
 events.addEventListener('transcript', event => {
   rememberCue(JSON.parse(event.data));
 });
-events.addEventListener('block', event => addBlockCard(JSON.parse(event.data)));
+events.addEventListener('block', event => {
+  const block = JSON.parse(event.data);
+  absorbPeople(block);
+  addBlockCard(block);
+});
 events.addEventListener('silence', event => {
   const data = JSON.parse(event.data);
   const placeholder = transcript.querySelector('.placeholder');

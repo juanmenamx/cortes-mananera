@@ -3,67 +3,121 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Cortes de la conferencia</title>
+  <title>Transcriptor de la conferencia</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
+  <div class="glow" aria-hidden="true">
+    <span></span>
+    <span></span>
+    <span></span>
+  </div>
   <main>
-    <div class="hero">
-      <header>
-        <p class="eyebrow">EFICIENCIA INFORMATIVA</p>
-        <h1>Cortes de la conferencia</h1>
-        <p class="intro">Pulsa Iniciar para tomar el último bloque de 30 segundos que ya existe. La plataforma sigue los siguientes, transcribe cada tramo y arma el video del bloque.</p>
-      </header>
-      <section id="video-panel" class="video-panel">
-        <div class="video-heading">
-          <p class="section-label">CLIP EN CURSO</p>
-          <span id="preview-label">Sin video</span>
-        </div>
-        <div class="video-frame">
-          <video id="preview" controls playsinline></video>
-          <p id="preview-empty">El clip aparecerá aquí al descargarse.</p>
-        </div>
-      </section>
-    </div>
-
-    <section class="control-panel">
-      <div class="start-row">
-        <button id="start" class="primary">Iniciar</button>
-        <button id="stop" class="danger" disabled>Detener</button>
-      </div>
-      <p class="hint">Iniciar toma el último bloque de 30 segundos que ya existe y sigue desde ahí. Nuevo bloque corta en el fotograma que se está viendo.</p>
-      <div class="status-row">
-        <span id="indicator" class="indicator"></span>
-        <span id="status">Lista para comenzar</span>
-        <span id="clock">—</span>
-        <span id="count">0 segmentos</span>
-      </div>
-      <button id="new-block" class="block-button" disabled>
-        <span>Cortar en este instante</span>
-        <strong>Nuevo bloque</strong>
-      </button>
-    </section>
-
-    <section class="transcript-panel">
-      <div class="panel-heading">
+    <header class="topbar">
+      <div class="brand">
+        <img src="/efinfo.png" alt="efinfo — Eficiencia Informativa">
+        <div class="brand-rule"></div>
         <div>
-          <p class="section-label">TRANSCRIPCIÓN DEL BLOQUE</p>
-          <h2>Texto acumulado</h2>
-        </div>
-        <div class="actions">
-          <button id="copy" class="secondary">Copiar</button>
-          <button id="download" class="secondary">Descargar TXT</button>
-          <button id="clear" class="secondary">Limpiar</button>
+          <p class="eyebrow">Eficiencia Informativa</p>
+          <h1>Transcriptor de la conferencia</h1>
         </div>
       </div>
-      <div id="transcript" class="transcript" contenteditable="true" role="textbox" aria-label="Transcripción editable">
-        <p class="placeholder">La transcripción aparecerá aquí…</p>
+      <p class="lede">Transcripción y edición de conferencias en tiempo real.</p>
+    </header>
+
+    <div class="layout">
+      <div class="column video-column">
+        <section class="card video-panel">
+          <div class="video-heading">
+            <p class="section-label">Video de la conferencia</p>
+            <span id="preview-label">Audio y controles</span>
+          </div>
+          <div class="video-frame">
+            <video id="preview" controls playsinline></video>
+            <p id="preview-empty">El clip aparecerá aquí al descargarse.</p>
+          </div>
+        </section>
       </div>
-    </section>
+
+      <div class="column">
+        <section class="card transcript-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="section-label accent">Transcripción en tiempo real</p>
+              <h2>Texto acumulado</h2>
+            </div>
+            <div class="actions">
+              <button id="copy" class="ghost" type="button">Copiar</button>
+              <button id="download" class="ghost" type="button">Descargar original TXT</button>
+              <button id="clear" class="danger" type="button">Limpiar</button>
+            </div>
+          </div>
+          <div id="transcript" class="transcript" contenteditable="true" role="textbox" aria-label="Transcripción editable">
+            <p class="placeholder">La transcripción aparecerá aquí…</p>
+          </div>
+          <p id="listening" class="listening" hidden><span></span>escuchando…</p>
+        </section>
+      </div>
+
+      <div class="column side">
+        <section class="card control-panel">
+          <div class="start-row">
+            <button id="start" class="primary" type="button">Iniciar</button>
+            <button id="stop" class="danger" type="button" disabled>Detener</button>
+            <button id="new-block" type="button" disabled>Nuevo bloque</button>
+          </div>
+          <div class="status-row">
+            <div class="status-live">
+              <span id="indicator" class="indicator"></span>
+              <span id="status">Lista para comenzar</span>
+            </div>
+            <div class="status-meta">
+              <span id="count">0 segmentos</span>
+              <span id="clock">—</span>
+            </div>
+          </div>
+          <p id="cut-error" class="cut-error" hidden></p>
+        </section>
+
+        <section class="card people-card">
+          <p class="section-label quiet">Tipo del siguiente bloque</p>
+          <div class="kind-row" role="group" aria-label="Tipo de corte">
+            <button id="kind-participacion" class="kind active" type="button">
+              <span class="radio"></span>
+              Participación
+            </button>
+            <button id="kind-pregunta" class="kind" type="button">
+              <span class="radio"></span>
+              Pregunta y respuestas
+            </button>
+          </div>
+          <p id="people-hint" class="people-hint"><strong>¿Quién o quiénes participaron en este bloque?</strong> Corrige nombre o cargo si es necesario y selecciona antes de finalizar.</p>
+
+          <div id="participants-group" class="people-group is-target">
+            <p class="group-label">Funcionarios</p>
+            <p class="group-note">Los que se presentan en el primer bloque. Nombre y cargo.</p>
+            <div id="participants" class="people-list"></div>
+            <button id="add-participant" class="ghost" type="button">Agregar funcionario</button>
+          </div>
+
+          <div id="reporters-group" class="people-group">
+            <p class="group-label">Reporteros</p>
+            <p class="group-note">Se agregan cuando toman la palabra. Nombre y medio.</p>
+            <div id="reporters" class="people-list"></div>
+            <button id="add-reporter" class="ghost" type="button">Agregar reportero</button>
+          </div>
+
+          <button id="clear-selection" class="clear-selection" type="button">Quitar selección</button>
+        </section>
+      </div>
+    </div>
 
     <section id="blocks-section" class="blocks-section" hidden>
       <div class="blocks-heading">
-        <p class="section-label">BLOQUES CORTADOS</p>
+        <p class="section-label accent">Bloques cortados</p>
         <h2>Video y texto para WhatsApp</h2>
       </div>
       <div id="blocks" class="blocks"></div>
