@@ -1,4 +1,3 @@
-const urlInput = document.querySelector('#clip-url');
 const startButton = document.querySelector('#start');
 const stopButton = document.querySelector('#stop');
 const statusText = document.querySelector('#status');
@@ -136,7 +135,6 @@ function setStatus(state, message, meta = {}) {
   indicator.className = `indicator ${state === 'running' || state === 'connecting' ? 'running' : state === 'error' ? 'error' : ''}`;
   startButton.disabled = running;
   stopButton.disabled = !running;
-  urlInput.disabled = running;
   newBlockButton.disabled = !running;
   if (meta.clock) clock.textContent = meta.clock;
   if (Number.isInteger(meta.count)) count.textContent = segmentCount(meta.count);
@@ -330,7 +328,6 @@ async function post(endpoint, body) {
 }
 
 startButton.addEventListener('click', async () => {
-  const url = urlInput.value.trim();
   transcript.innerHTML = '<p class="placeholder">Buscando el bloque de 30 segundos…</p>';
   blocksContainer.innerHTML = '';
   blocksSection.hidden = true;
@@ -341,7 +338,7 @@ startButton.addEventListener('click', async () => {
   count.textContent = '0 segmentos';
   setStatus('connecting', 'Buscando el bloque de 30 segundos…');
   try {
-    await post('/api/start', { url });
+    await post('/api/start', {});
   } catch (error) {
     setStatus('error', error.message);
   }

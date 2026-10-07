@@ -31,7 +31,7 @@ h1 { font-family: Georgia, serif; font-size: clamp(2.3rem, 5vw, 4.1rem); font-we
 .control-panel, .transcript-panel, .video-panel, .block-card { background: rgba(255,255,255,.92); border: 1px solid var(--line); border-radius: 18px; box-shadow: 0 16px 50px rgba(35, 49, 42, .07); }
 .control-panel { padding: 22px; margin-bottom: 18px; }
 label { display: block; font-size: .83rem; font-weight: 750; margin: 0 0 8px; }
-.url-row { display: grid; grid-template-columns: 1fr auto auto; gap: 10px; }
+.start-row { display: flex; gap: 10px; }
 input { width: 100%; border: 1px solid #cbd4cf; border-radius: 10px; padding: 13px 14px; font: inherit; outline: none; }
 input:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(12,104,71,.1); }
 button { border: 0; border-radius: 10px; cursor: pointer; font: inherit; font-size: .87rem; font-weight: 750; padding: 12px 16px; transition: .15s ease; }
@@ -96,7 +96,7 @@ h2 { font-family: Georgia, serif; font-size: 1.5rem; font-weight: 500; margin: 0
 .raw-details pre { white-space: pre-wrap; font: .92rem/1.5 Georgia, serif; color: var(--ink); }
 
 @media (max-width: 860px) {
-  .hero, .url-row { grid-template-columns: 1fr; }
+  .hero { grid-template-columns: 1fr; }
   .video-panel { justify-self: stretch; width: 100%; }
   #count { margin-left: 0; }
 }
