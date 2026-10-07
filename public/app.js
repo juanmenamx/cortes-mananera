@@ -224,25 +224,42 @@ function takeClosedParagraphs(block) {
   }
 }
 
+function cutFactsText(block) {
+  const envio = {
+    ...(block.fecha ? { fecha: block.fecha } : {}),
+    ...(block.envio || {}),
+    marcas: block.marcas,
+    duracion: block.duracion,
+    inicio_marca: block.inicio_marca,
+    fin_marca: block.fin_marca,
+    precio: block.precio == null || block.precio === '' ? (block.precioError || '—') : block.precio,
+    digest: block.digest || '—'
+  };
+  return Object.entries(envio).map(([key, value]) => `${key}: ${value ?? '—'}`).join('\n');
+}
+
 function addBlockCard(block) {
   if (!block || seenBlocks.has(block.blockNumber)) return;
   seenBlocks.add(block.blockNumber);
   blocksSection.hidden = false;
   const card = document.createElement('article');
   card.className = 'block-card';
-  const ready = Boolean(block.videoUrl) && !block.formatError;
-  const failed = Boolean(block.cutError || block.formatError);
+  const ready = Boolean(block.videoUrl) && !block.formatError && !block.noteError;
+  const failed = Boolean(block.cutError || block.formatError || block.noteError);
   card.innerHTML = `
     <div class="block-card-head">
       <strong>Bloque ${block.blockNumber}</strong>
       <span class="block-state ${ready ? 'ready' : failed ? 'error' : ''}"></span>
     </div>
     <p class="block-meta"></p>
+    <pre class="cut-facts"></pre>
+    <p class="note-state" hidden></p>
     <video class="block-video" controls playsinline></video>
     <p class="saved-path"></p>
     <pre class="formatted" contenteditable="true"></pre>
     <div class="block-card-actions">
       <a class="secondary download-block" download>Descargar video</a>
+      <button class="secondary copy-facts">Copiar datos del corte</button>
       <button class="secondary copy-block">Copiar para WhatsApp</button>
     </div>
     <details class="raw-details">
@@ -252,10 +269,22 @@ function addBlockCard(block) {
   const state = card.querySelector('.block-state');
   state.textContent = block.cutError
     ? 'No se pudo cortar el video'
-    : block.formatError
-      ? 'Video listo; falló el texto'
-      : 'Listo para revisar';
+    : block.noteError
+      ? 'No se registró la nota'
+      : block.formatError
+        ? 'Video listo; falló el texto'
+        : 'Listo para revisar';
   card.querySelector('.block-meta').textContent = `${block.label} · ${segmentCount(block.clipCount)}`;
+  card.querySelector('.cut-facts').textContent = cutFactsText(block);
+  const note = card.querySelector('.note-state');
+  if (block.noteError) {
+    note.hidden = false;
+    note.classList.add('error');
+    note.textContent = block.noteError;
+  } else if (block.nota) {
+    note.hidden = false;
+    note.textContent = `Nota ${block.nota}`;
+  }
   const video = card.querySelector('.block-video');
   const download = card.querySelector('.download-block');
   const saved = card.querySelector('.saved-path');
@@ -302,8 +331,7 @@ async function post(endpoint, body) {
 
 startButton.addEventListener('click', async () => {
   const url = urlInput.value.trim();
-  if (!url) return setStatus('error', 'Pega primero la liga de un clip.');
-  transcript.innerHTML = '<p class="placeholder">Buscando el primer clip…</p>';
+  transcript.innerHTML = '<p class="placeholder">Buscando el bloque de 30 segundos…</p>';
   blocksContainer.innerHTML = '';
   blocksSection.hidden = true;
   seenBlocks.clear();
@@ -311,7 +339,7 @@ startButton.addEventListener('click', async () => {
   resetPlayback();
   clock.textContent = '—';
   count.textContent = '0 segmentos';
-  setStatus('connecting', 'Buscando el primer clip…');
+  setStatus('connecting', 'Buscando el bloque de 30 segundos…');
   try {
     await post('/api/start', { url });
   } catch (error) {
@@ -366,9 +394,12 @@ clearButton.addEventListener('click', () => {
 });
 
 blocksContainer.addEventListener('click', async event => {
-  const button = event.target.closest('.copy-block');
+  const button = event.target.closest('.copy-block, .copy-facts');
   if (!button) return;
-  const text = button.closest('.block-card').querySelector('.formatted').innerText.trim();
+  const card = button.closest('.block-card');
+  const text = button.classList.contains('copy-facts')
+    ? card.querySelector('.cut-facts').innerText.trim()
+    : card.querySelector('.formatted').innerText.trim();
   await navigator.clipboard.writeText(text);
   const original = button.textContent;
   button.textContent = 'Copiado';

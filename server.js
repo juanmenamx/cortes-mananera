@@ -10,6 +10,7 @@ const {
   buildClipUrl,
   clock,
   clockAt,
+  instantAt,
   parseClipUrl,
   rangeLabel,
   segmentPlan,
@@ -29,6 +30,25 @@ const TEMP_DIR = process.env.TEMP_DIR || path.join(process.env.LOCALAPPDATA || o
 const FFMPEG = process.env.FFMPEG_PATH || path.join(__dirname, '..', 'youtube-portable', 'bin', 'ffmpeg.exe');
 const GRACE_MS = Number(process.env.CLIP_GRACE_MS || 60000);
 const POLL_MS = 2000;
+const PRECIO_URL = 'https://pmedia.efinf.com/sc-be/api/sc/getPrecio.php';
+const BLOQUES_URL = 'https://pmedia.efinf.com/sc-be/api/sc/getBloques.php';
+const NOTE_HEADER_URL = 'https://pmedia.efinf.com/sc-be/api/sc/setNoteHeader.php';
+const BLOQUES_IP_PREFIX = '192.168.10.';
+const PRECIO_MEDIO = 17452;
+const PRECIO_PROGRAMA = 7016;
+const NOTE_HEADER_FIXED = {
+  opcion: 'crear',
+  tipo: 'cabeceo',
+  cabeceo: 1,
+  id_medio: PRECIO_MEDIO,
+  id_programa: PRECIO_PROGRAMA,
+  ids_conductores: '5957',
+  id_genero: 139,
+  id_user: 57,
+  id_user_data4: 2667,
+  id_rec: 516,
+  alerta: 1
+};
 
 fs.mkdirSync(TEMP_DIR, { recursive: true });
 fs.mkdirSync(OUTPUT_DIR, { recursive: true });
@@ -273,6 +293,135 @@ function pointClock(session, point) {
   return clockAt(source.stamp, point.time);
 }
 
+function pointInstant(session, point) {
+  const source = session.sources[sourceOrdinal(session, point.mediaUrl)];
+  return instantAt(source.stamp, point.time);
+}
+
+function pmediaHeaders(extra = {}) {
+  const token = process.env.PRECIO_API_TOKEN;
+  if (!token) throw new Error('Falta PRECIO_API_TOKEN para consultar pmedia.');
+  return {
+    Accept: 'application/json',
+    Authorization: `Bearer ${token}`,
+    'X-Api-Key': token,
+    ...extra
+  };
+}
+
+function pad2(value) {
+  return String(value).padStart(2, '0');
+}
+
+function bloquesQueryNow() {
+  const now = new Date();
+  const second = Math.floor(now.getSeconds() / 30) * 30;
+  const stamp = `${now.getFullYear()}${pad2(now.getMonth() + 1)}${pad2(now.getDate())}${pad2(now.getHours())}${pad2(now.getMinutes())}${pad2(second)}`;
+  return {
+    ip: `${BLOQUES_IP_PREFIX}69`,
+    canal: 'HDMI2',
+    idMedio: PRECIO_MEDIO,
+    fecha: `${stamp.slice(0, 4)}-${stamp.slice(4, 6)}-${stamp.slice(6, 8)}`,
+    inicio: '00:00:00',
+    fin: '23:59:59',
+    stamp
+  };
+}
+
+function bloquesQuery(source, clipUrl) {
+  const prefix = String(source.prefix || '');
+  const match = prefix.match(/^(.*)-(\d+)-$/);
+  const canal = match ? match[1] : 'HDMI2';
+  const idMedio = match ? Number(match[2]) : PRECIO_MEDIO;
+  const fecha = `${source.stamp.slice(0, 4)}-${source.stamp.slice(4, 6)}-${source.stamp.slice(6, 8)}`;
+  const inicio = '00:00:00';
+  let octet = '69';
+  try {
+    const segment = new URL(clipUrl).pathname.split('/').find(part => /^\d{1,3}$/.test(part));
+    if (segment != null && Number(segment) <= 255) octet = String(Number(segment));
+  } catch {
+    octet = '69';
+  }
+  return { ip: `${BLOQUES_IP_PREFIX}${octet}`, canal, idMedio, fecha, inicio, fin: '23:59:59' };
+}
+
+async function fetchBloques30(query) {
+  const url = new URL(BLOQUES_URL);
+  url.searchParams.set('ip', query.ip);
+  url.searchParams.set('canal', query.canal);
+  url.searchParams.set('idMedio', String(query.idMedio));
+  url.searchParams.set('fecha', query.fecha);
+  url.searchParams.set('inicio', query.inicio);
+  url.searchParams.set('fin', query.fin);
+  url.searchParams.set('duraciones', '30s');
+  const response = await fetch(url, {
+    headers: pmediaHeaders(),
+    signal: AbortSignal.timeout(20000)
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok || body.success === false) {
+    const detail = [body.error, body.detail].filter(Boolean).join(' ');
+    throw new Error(detail || `No se pudieron consultar los bloques (${response.status})`);
+  }
+  const list = body.bloques?.['30s'];
+  if (!Array.isArray(list)) throw new Error('La respuesta no incluye bloques de 30 segundos.');
+  return list
+    .filter(item => item?.url)
+    .sort((a, b) => String(a.inicio).localeCompare(String(b.inicio)));
+}
+
+async function fetchPrecio({ fecha, duracion }) {
+  const url = new URL(PRECIO_URL);
+  url.searchParams.set('fecha', fecha);
+  url.searchParams.set('id_medio', String(PRECIO_MEDIO));
+  url.searchParams.set('id_programa', String(PRECIO_PROGRAMA));
+  url.searchParams.set('duracion', String(duracion));
+  const response = await fetch(url, {
+    headers: pmediaHeaders(),
+    signal: AbortSignal.timeout(20000)
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok || body.success === false) {
+    throw new Error(body.error || body.message || `No se pudo obtener el precio (${response.status})`);
+  }
+  if (body.data?.precio == null) throw new Error('La respuesta no incluye precio.');
+  return body.data.precio;
+}
+
+function notePayload(block, precio) {
+  return {
+    ...NOTE_HEADER_FIXED,
+    marcas: block.marcas,
+    duracion: block.duracion,
+    inicio_marca: block.inicio_marca,
+    fin_marca: block.fin_marca,
+    precio
+  };
+}
+
+async function setNoteHeader(fields) {
+  const body = new URLSearchParams();
+  for (const [key, value] of Object.entries(fields)) body.set(key, String(value));
+  const response = await fetch(NOTE_HEADER_URL, {
+    method: 'POST',
+    headers: pmediaHeaders({ 'Content-Type': 'application/x-www-form-urlencoded' }),
+    body,
+    signal: AbortSignal.timeout(20000)
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || payload.success === false) {
+    const detail = [payload.error, payload.detail, payload.message].filter(Boolean).join('\n');
+    throw new Error(detail || `No se pudo registrar la nota (${response.status})`);
+  }
+  const data = payload.data && typeof payload.data === 'object' ? payload.data : {};
+  const id = data.id ?? data.id_nota ?? data.idNota ?? payload.id;
+  const digest = data.digest ?? data.md5 ?? payload.digest ?? (typeof payload.data === 'string' ? payload.data : '');
+  return {
+    nota: id == null ? 'registrada' : `registrada ${id}`,
+    digest: digest == null ? '' : String(digest)
+  };
+}
+
 function wordsText(words) {
   return (words || []).map(word => word.word).join(' ').trim();
 }
@@ -400,6 +549,9 @@ async function waitUntilCovered(session, endPoint) {
 async function buildBlock(session, clips, blockNumber, editedText, range) {
   const from = pointClock(session, range.start);
   const to = pointClock(session, range.end);
+  const inicio = pointInstant(session, range.start);
+  const fin = pointInstant(session, range.end);
+  const duracion = Math.max(1, fin.epoch - inicio.epoch);
   const filename = `bloque-${String(blockNumber).padStart(2, '0')}-${from.replace(/[:.]/g, '')}-${to.replace(/[:.]/g, '')}.mp4`;
   const output = path.join(session.dir, 'cortes', filename);
   const rawText = serverTranscript(clips).trim() || String(editedText || '').trim();
@@ -417,7 +569,17 @@ async function buildBlock(session, clips, blockNumber, editedText, range) {
     videoUrl: '',
     savedPath: '',
     cut: range.end,
-    cutError: ''
+    cutError: '',
+    marcas: `${inicio.fecha} ${inicio.clock}|${fin.fecha} ${fin.clock}`,
+    duracion,
+    inicio_marca: inicio.epoch,
+    fin_marca: fin.epoch,
+    fecha: inicio.fecha,
+    precio: null,
+    precioError: '',
+    nota: '',
+    noteError: '',
+    digest: ''
   };
 
   const tasks = [
@@ -429,6 +591,29 @@ async function buildBlock(session, clips, blockNumber, editedText, range) {
       log('No se pudo cortar el bloque', { blockNumber, message: error.message });
     })
   ];
+
+  tasks.push((async () => {
+    let precio;
+    try {
+      precio = await fetchPrecio({ fecha: inicio.fecha, duracion });
+      block.precio = precio;
+    } catch (error) {
+      block.precioError = publicError(error);
+      block.envio = notePayload(block, '');
+      log('No se pudo obtener el precio', { blockNumber, message: block.precioError });
+      return;
+    }
+    const envio = notePayload(block, precio);
+    block.envio = envio;
+    try {
+      const note = await setNoteHeader(envio);
+      block.nota = note.nota;
+      block.digest = note.digest;
+    } catch (error) {
+      block.noteError = publicError(error);
+      log('No se pudo registrar la nota', { blockNumber, message: block.noteError });
+    }
+  })());
 
   if (rawText) {
     tasks.push(formatBlock({
@@ -578,26 +763,61 @@ async function ingestClip(session, source, stamp) {
 }
 
 async function runLoop(session, source) {
-  let stamp = source.stamp;
+  const seen = new Set();
+  let lastStamp = source.stamp;
+  let caughtUp = false;
   while (!session.stopping) {
     while (session.pause && !session.stopping) await sleep(40);
     if (session.stopping) return;
-    const url = buildClipUrl(source, stamp);
-    const found = await waitForClip(session, url, stamp);
-    if (!found) {
-      if (!session.clips.length) throw new Error('No se encontró ese clip. Revisa la liga y que el archivo ya exista.');
-      return;
-    }
-    while (session.pause && !session.stopping) await sleep(40);
-    if (session.stopping) return;
+    let bloques = [];
     try {
-      await ingestClip(session, source, stamp);
+      bloques = await fetchBloques30(session.bloquesQuery);
     } catch (error) {
-      if (isAuthError(error)) throw error;
-      log('No se pudo incorporar el clip', { stamp, message: publicError(error) });
-      sendEvent('notice', { message: `Se omitió el clip de las ${clock(stamp)}.` });
+      const message = publicError(error);
+      log('No se pudieron consultar los bloques de 30 segundos', { message });
+      sendEvent('notice', { message });
+      if (!session.clips.length && Date.now() >= stampDeadline(lastStamp, CLIP_STEP_SECONDS, GRACE_MS)) throw error;
+      await sleep(POLL_MS);
+      continue;
     }
-    stamp = addSeconds(stamp, CLIP_STEP_SECONDS);
+    if (!caughtUp && bloques.length) {
+      const latest = bloques[bloques.length - 1];
+      for (const item of bloques) {
+        if (item.url !== latest.url) seen.add(item.url);
+      }
+      caughtUp = true;
+      log('Se toma el último bloque de 30 segundos', { inicio: latest.inicio, url: latest.url });
+    }
+    const pending = bloques.filter(item => !seen.has(item.url));
+    if (!pending.length) {
+      const deadline = stampDeadline(lastStamp, CLIP_STEP_SECONDS, GRACE_MS);
+      if (Date.now() >= deadline) {
+        if (!session.clips.length) throw new Error('No se encontró un bloque de 30 segundos a partir de esa liga.');
+        return;
+      }
+      session.message = 'Esperando el siguiente bloque de 30 segundos';
+      sendEvent('status', { state: 'running', message: session.message, clock: session.clock, count: session.clips.length });
+      await sleep(POLL_MS);
+      continue;
+    }
+    for (const item of pending) {
+      while (session.pause && !session.stopping) await sleep(40);
+      if (session.stopping) return;
+      seen.add(item.url);
+      const parsed = parseClipUrl(item.url);
+      if (!parsed) {
+        log('Se omitió un bloque de 30 segundos sin liga válida', { url: item.url });
+        continue;
+      }
+      lastStamp = parsed.stamp;
+      try {
+        await ingestClip(session, parsed, parsed.stamp);
+      } catch (error) {
+        if (isAuthError(error)) throw error;
+        log('No se pudo incorporar el clip', { stamp: parsed.stamp, message: publicError(error) });
+        sendEvent('notice', { message: `Se omitió el clip de las ${clock(parsed.stamp)}.` });
+      }
+    }
   }
 }
 
@@ -609,8 +829,17 @@ function clearPreviousSessions() {
 
 async function startSession(clipUrl) {
   if (active) throw new Error('Ya hay una captura en curso. Deténla antes de iniciar otra.');
-  const source = parseClipUrl(clipUrl);
-  if (!source) throw new Error('La liga no tiene el formato de clip: nombre-AAAAMMDDhhmmss.mp4');
+  const pasted = String(clipUrl || '').trim();
+  const parsed = pasted ? parseClipUrl(pasted) : null;
+  if (pasted && !parsed) throw new Error('La liga no tiene el formato de clip: nombre-AAAAMMDDhhmmss.mp4');
+  const query = parsed ? bloquesQuery(parsed, pasted) : bloquesQueryNow();
+  const source = parsed || {
+    dir: '',
+    prefix: `${query.canal}-${query.idMedio}-`,
+    ext: '.mp4',
+    stamp: query.stamp,
+    url: ''
+  };
   assertTranscriptionReady();
   if (!fs.existsSync(FFMPEG)) throw new Error(`No se encontró ffmpeg en ${FFMPEG}`);
 
@@ -625,6 +854,7 @@ async function startSession(clipUrl) {
     id,
     dir,
     source,
+    bloquesQuery: query,
     clips: [],
     blocks: [],
     nextBlock: 1,
@@ -644,7 +874,7 @@ async function startSession(clipUrl) {
   };
   active = session;
   sendEvent('status', { state: 'connecting', message: session.message, clock: session.clock, count: 0 });
-  log('Captura iniciada', { id, url: source.url });
+  log('Captura iniciada', { id, url: source.url, bloques: query });
 
   session.done = (async () => {
     let failed = false;
