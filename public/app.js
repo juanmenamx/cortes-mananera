@@ -304,23 +304,20 @@ function mountCue(cue) {
   paragraph.dataset.index = String(cue.index);
   paragraph.dataset.media = cue.sourceMediaUrl || '';
   paragraph.classList.add('pending');
-  const heading = document.createElement('time');
-  heading.textContent = cue.label;
-  paragraph.append(heading);
-  for (const word of cue.words) {
+  cue.words.forEach((word, index) => {
     const span = document.createElement('span');
     span.className = 'word pending';
     span.dataset.at = String(word.at);
-    const stamp = document.createElement('time');
-    stamp.textContent = word.clock;
-    span.append(stamp, document.createTextNode(` ${word.word}`));
-    paragraph.append(document.createTextNode(' '), span);
-  }
+    span.textContent = word.word;
+    if (index > 0) paragraph.append(document.createTextNode(' '));
+    paragraph.append(span);
+  });
   transcript.appendChild(paragraph);
   archive.push({
     index: cue.index,
     label: cue.label,
-    text: cue.words.map(word => word.word).join(' ')
+    text: cue.words.map(word => word.word).join(' '),
+    timed: cue.words.map(word => word.clock ? `[${word.clock}] ${word.word}` : word.word).join(' ')
   });
 }
 
@@ -385,7 +382,7 @@ function addBlockCard(block) {
   blocksSection.hidden = false;
   const card = document.createElement('article');
   card.className = 'block-card';
-  const ready = Boolean(block.videoUrl) && !block.formatError && !block.noteError;
+  const ready = !block.formatError && !block.noteError;
   const failed = Boolean(block.cutError || block.formatError || block.noteError);
   card.innerHTML = `
     <div class="block-card-head">
@@ -567,7 +564,7 @@ copyButton.addEventListener('click', async () => {
 
 downloadButton.addEventListener('click', () => {
   if (!archive.length) return;
-  const cleanText = archive.map(item => item.text).join('\n\n');
+  const cleanText = archive.map(item => item.timed || item.text).join('\n\n');
   const blob = new Blob([`${cleanText}\n`], { type: 'text/plain;charset=utf-8' });
   const link = document.createElement('a');
   link.href = URL.createObjectURL(blob);

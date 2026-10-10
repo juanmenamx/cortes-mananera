@@ -212,8 +212,6 @@ a.ghost { display: inline-block; text-decoration: none; }
 }
 .transcript p { margin: 0 0 16px; max-width: 74ch; text-align: justify; }
 .transcript .placeholder { color: rgba(11, 42, 61, .45); font-style: italic; }
-.transcript time { color: var(--blue); display: block; font-size: 12px; font-style: normal; font-weight: 600; margin-bottom: 2px; }
-.transcript .word time { display: inline; font-size: 11px; margin: 0 4px 0 0; }
 .transcript p.pending, .transcript .word.pending { display: none; }
 .listening {
   display: flex;

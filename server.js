@@ -158,7 +158,7 @@ function publicClip(session, clip) {
     text: clip.text,
     words: clip.words || [],
     offset: clip.offset || 0,
-    mediaUrl: mediaUrl(session.id, 'clips', clip.filename),
+    mediaUrl: clip.sourceMediaUrl || clip.url || '',
     sourceMediaUrl: clip.sourceMediaUrl || ''
   };
 }
@@ -208,17 +208,27 @@ async function waitForClip(session, url, stamp) {
   return false;
 }
 
-async function downloadClip(url, dest) {
-  const response = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(60000) });
-  const type = (response.headers.get('content-type') || '').toLowerCase();
-  if (!response.ok || !type.includes('video/')) throw new Error('El clip dejó de estar disponible al descargarlo.');
-  const bytes = Buffer.from(await response.arrayBuffer());
-  const expected = Number(response.headers.get('content-length'));
-  const incomplete = bytes.length < 1000
-    || (Number.isFinite(expected) && expected > bytes.length)
-    || !bytes.includes(Buffer.from('moov'));
-  if (incomplete) throw new Error('El clip todavía se está grabando.');
-  fs.writeFileSync(dest, bytes);
+async function clipIsComplete(url) {
+  try {
+    await run(FFMPEG, ['-v', 'error', '-i', url, '-t', '0.05', '-f', 'null', '-']);
+    return true;
+  } catch (error) {
+    const message = String(error.message || '');
+    if (/moov atom not found|invalid data|error opening input/i.test(message)) return false;
+    throw error;
+  }
+}
+
+async function extractAudioSegment(url, wavFile, offset, duration) {
+  await run(FFMPEG, [
+    '-y',
+    '-ss', String(offset),
+    '-t', String(duration),
+    '-i', url,
+    '-vn', '-ac', '1', '-ar', '16000',
+    '-c:a', 'pcm_s16le',
+    wavFile
+  ]);
 }
 
 async function extractAudio(videoFile, wavFile) {
@@ -254,10 +264,14 @@ async function cutVideos(clips, output) {
   }
 }
 
+function timedText(clip) {
+  if (clip.words?.length) return clip.words.map(word => `[${word.clock}] ${word.word}`).join(' ');
+  return String(clip.text || '').trim();
+}
+
 function serverTranscript(clips) {
   return clips
-    .filter(clip => clip.text)
-    .map(clip => clip.text.trim())
+    .map(clip => timedText(clip))
     .filter(Boolean)
     .join('\n\n');
 }
@@ -553,8 +567,6 @@ async function buildBlock(session, clips, blockNumber, editedText, range) {
   const inicio = pointInstant(session, range.start);
   const fin = pointInstant(session, range.end);
   const duracion = Math.max(1, fin.epoch - inicio.epoch);
-  const filename = `bloque-${String(blockNumber).padStart(2, '0')}-${from.replace(/[:.]/g, '')}-${to.replace(/[:.]/g, '')}.mp4`;
-  const output = path.join(session.dir, 'cortes', filename);
   const rawText = serverTranscript(clips).trim() || String(editedText || '').trim();
   const rangeSource = session.sources[sourceOrdinal(session, range.start.mediaUrl)];
   const block = {
@@ -583,15 +595,7 @@ async function buildBlock(session, clips, blockNumber, editedText, range) {
     digest: ''
   };
 
-  const tasks = [
-    renderRange(session, range.start, range.end, output).then(() => {
-      block.videoUrl = mediaUrl(session.id, 'cortes', filename);
-      block.savedPath = publishCut(output, filename);
-    }).catch(error => {
-      block.cutError = error.message;
-      log('No se pudo cortar el bloque', { blockNumber, message: error.message });
-    })
-  ];
+  const tasks = [];
 
   tasks.push((async () => {
     let precio;
@@ -728,9 +732,8 @@ function segmentFilename(source, stamp, offset) {
 async function publishSegment(session, source, fileStamp, url, sourceFile, sourceMediaUrl, part) {
   const stamp = addSeconds(fileStamp, part.offset);
   const toStamp = addSeconds(stamp, part.duration);
-  const filename = segmentFilename(source, fileStamp, part.offset);
-  const file = path.join(session.dir, 'clips', filename);
-  const wav = path.join(session.dir, 'audio', `${path.parse(filename).name}.wav`);
+  const wavName = `${source.prefix}${fileStamp}-${String(part.offset).padStart(2, '0')}`.replace(/[^\w.\-]+/g, '_');
+  const wav = path.join(session.dir, 'audio', `${wavName}.wav`);
   const clip = {
     index: session.clips.length,
     stamp,
@@ -739,8 +742,8 @@ async function publishSegment(session, source, fileStamp, url, sourceFile, sourc
     to: clock(toStamp),
     label: rangeLabel(stamp, part.duration),
     url,
-    filename,
-    file,
+    filename: '',
+    file: '',
     text: '',
     words: [],
     offset: part.offset,
@@ -752,9 +755,8 @@ async function publishSegment(session, source, fileStamp, url, sourceFile, sourc
 
   session.message = `Transcribiendo ${clip.label}`;
   sendEvent('status', { state: 'running', message: session.message, clock: clip.label, count: session.clips.length });
-  await cutSegment(sourceFile, file, part.offset, part.duration);
   try {
-    await extractAudio(file, wav);
+    await extractAudioSegment(url, wav, part.offset, part.duration);
     const result = await transcribe(wav);
     const text = String(result?.text || '').trim();
     if (!looksLikeHallucination(text, session.lastText)) {
@@ -767,7 +769,11 @@ async function publishSegment(session, source, fileStamp, url, sourceFile, sourc
       session.lastText = text;
     }
   } catch (error) {
-    log('Segmento sin transcripción utilizable', { file: filename, message: publicError(error) });
+    const message = publicError(error);
+    if (/moov atom not found|invalid data|error opening input/i.test(message)) {
+      throw new Error('El clip todavía se está grabando.');
+    }
+    log('Segmento sin transcripción utilizable', { url, offset: part.offset, message });
     if (isAuthError(error)) clip.authError = error;
     else sendEvent('notice', { message: `No se pudo transcribir ${clip.label}.` });
   } finally {
@@ -777,7 +783,7 @@ async function publishSegment(session, source, fileStamp, url, sourceFile, sourc
   clip.ready = true;
   session.clips.push(clip);
   session.clock = clip.label;
-  session.previewUrl = mediaUrl(session.id, 'clips', filename);
+  session.previewUrl = sourceMediaUrl;
   session.message = clip.text ? 'Transcribiendo' : 'Segmento recibido; esperando voz clara…';
   sendEvent('clip', publicClip(session, clip));
   if (clip.text) sendEvent('transcript', publicClip(session, clip));
@@ -786,19 +792,16 @@ async function publishSegment(session, source, fileStamp, url, sourceFile, sourc
   if (clip.authError) throw clip.authError;
 }
 
-async function ingestClip(session, source, stamp) {
-  const sourceName = `${source.prefix}${stamp}${source.ext}`.replace(/[^\w.\-]+/g, '_');
-  const sourceFile = path.join(session.dir, 'clips', sourceName);
-  const url = buildClipUrl(source, stamp);
+async function ingestClip(session, source, stamp, remoteUrl) {
+  const url = remoteUrl || buildClipUrl(source, stamp);
   const label = rangeLabel(stamp, CLIP_STEP_SECONDS);
-  session.message = `Descargando ${label}`;
+  session.message = `Revisando ${label}`;
   sendEvent('status', { state: 'running', message: session.message, clock: label, count: session.clips.length });
-  await downloadClip(url, sourceFile);
-  const sourceMediaUrl = mediaUrl(session.id, 'clips', sourceName);
-  session.sources.push({ mediaUrl: sourceMediaUrl, label, file: sourceFile, stamp });
-  if (!session.rangeStart) session.rangeStart = { mediaUrl: sourceMediaUrl, time: 0 };
-  session.previewUrl = sourceMediaUrl;
-  sendEvent('source', { mediaUrl: sourceMediaUrl, label, playableSeconds: CLIP_STEP_SECONDS });
+  if (!(await clipIsComplete(url))) throw new Error('El clip todavía se está grabando.');
+  session.sources.push({ mediaUrl: url, label, file: '', stamp });
+  if (!session.rangeStart) session.rangeStart = { mediaUrl: url, time: 0 };
+  session.previewUrl = url;
+  sendEvent('source', { mediaUrl: url, label, playableSeconds: CLIP_STEP_SECONDS });
 
   for (const part of segmentPlan()) {
     while (session.pause && !session.stopping) await sleep(40);
@@ -810,9 +813,9 @@ async function ingestClip(session, source, stamp) {
       continue;
     }
     try {
-      await publishSegment(session, source, stamp, url, sourceFile, sourceMediaUrl, part);
+      await publishSegment(session, source, stamp, url, '', url, part);
     } catch (error) {
-      if (isAuthError(error)) throw error;
+      if (isAuthError(error) || /todavía se está grabando/i.test(error.message || '')) throw error;
       log('No se pudo transcribir un segmento', { stamp, offset: part.offset, message: publicError(error) });
       sendEvent('notice', { message: `Se omitió el segmento de las ${clock(addSeconds(stamp, part.offset))}.` });
     } finally {
@@ -871,7 +874,7 @@ async function runLoop(session, source) {
         continue;
       }
       try {
-        await ingestClip(session, parsed, parsed.stamp);
+        await ingestClip(session, parsed, parsed.stamp, item.url);
         seen.add(item.url);
         waiting.delete(item.url);
         lastStamp = parsed.stamp;
@@ -922,9 +925,7 @@ async function startSession(clipUrl) {
   clearPreviousSessions();
   const id = randomUUID();
   const dir = path.join(TEMP_DIR, id);
-  fs.mkdirSync(path.join(dir, 'clips'), { recursive: true });
   fs.mkdirSync(path.join(dir, 'audio'), { recursive: true });
-  fs.mkdirSync(path.join(dir, 'cortes'), { recursive: true });
 
   const session = {
     id,
